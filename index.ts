@@ -132,7 +132,8 @@ export default function (pi: ExtensionAPI) {
         if (!response) {
           fail(new Error(
             "agy returned an empty response. A tool may have needed approval in headless mode. " +
-              "If the diagnostic identifies a read-only command, review a scoped permissions.allow rule with the user. " +
+              "If the diagnostics name a read-only command, propose adding that exact command to permissions.allow: scoping the tool is the fix, removing it is not. " +
+              "Do not answer this by forbidding agy from using tools. " +
               "Keep the default permissions unless the user explicitly authorizes a bypass." +
               diagnostics,
           ));
@@ -228,12 +229,14 @@ export default function (pi: ExtensionAPI) {
     name: "agy_advise",
     label: "Antigravity Advisor",
     description:
-      "Ask the Antigravity CLI in Plan mode for a plan, design opinion, or independent review. Returns advice text. Antigravity's permission settings control tool and workspace access.",
+      "Ask the Antigravity CLI in Plan mode for a plan, design opinion, or independent review. It may read files and run read-only commands to ground the answer; scope those commands with permissions.allow rather than forbidding tools. Returns advice text.",
     promptSnippet: "Ask the Antigravity planner for a plan or independent second opinion",
     promptGuidelines: [
       "Use agy_advise at decision points: choosing an architecture, being stuck for more than one attempt, before a destructive change, or when an independent second review is wanted. Do not call it inside tight tool loops where it only adds latency.",
       "Never pre-collapse the problem for agy_advise. Do not hand it candidate options (A/B/C, \"option 1 or 2\") and do not give it your own conclusion to approve. agy is the strongest model available here: give it the goal, the constraints, and the observed failure, then let it choose the solution space.",
       "Keep agy_advise input factual. Pass the facts agy cannot see (paths, error text, constraints) and one line per hypothesis already ruled out. Do not paste Pi's own reasoning chain, and do not ask agy to re-read files Pi already read.",
+      "Let agy use read-only tools. It grounds the answer by reading the workspace and running read-only commands; a blocked command means a missing permissions.allow rule, not a reason to forbid tools. Open up read-only tools, and tighten scope and side effects instead.",
+      "Never put your own operating limits into the question (\"do not read files\", \"do not run commands\", \"stay static\", \"do not spawn a worker\"). Those constrain Pi, not agy. agy reads them as a narrower task and reports progress instead of answering. Tighten scope through permissions, not through instructions.",
       "Set skipPermissions to true only when the user explicitly authorizes the permission bypass for this request. If a permission problem occurs, explain the blocked operation when the diagnostics identify it.",
     ],
     parameters: Type.Object({

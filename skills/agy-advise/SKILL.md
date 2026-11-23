@@ -57,11 +57,33 @@ description: 用 Pi 的 agy_advise 工具向 Antigravity CLI 请求独立分析�
 
 同理，不要把「先不要贸然动手」这类对 Pi 的自我提醒发给 agy。agy 不知道 Pi 的下一步，看到这种话只会理解成「不要给出可执行结论」。
 
-正确做法是按任务配权限，而不是在问题里禁止：
+## 工具：放开只读，收紧范围
 
-- 需要它看代码或跑命令时，先把命令加进 `permissions.allow`（`command(objdump)`、`command(strings)`、`command(python3)`、`command(nm)`、`command(sha256sum)` 这类要逐条加）。没加就一定会空响应。
-- 确实不需要读代码时，写成「不需要读代码，基于下面给出的事实回答」——这是降低它去读的动机，不是保证它不读。
-- 命令被拦时不要用 `skipPermissions` 当快捷键。先看 stderr 指出的是哪条命令，把那条加进 allow。
+一句话规则：**会读取内容的能力尽量放开，会改变状态的能力收紧，作用范围锁在项目内。**
+
+禁止工具并不能换来安全，只会把权限问题变成一次空响应，同时让 agy 只能凭猜推理。区分两件事：
+
+| 想防的 | 错误做法 | 正确做法 |
+| --- | --- | --- |
+| 乱改文件 | 在 `question` 里禁止工具 | plan 模式 + `artifactReviewPolicy` + 危险命令进 `deny` |
+| 跑危险命令 | 只留 `find`/`ls`/`rg` | 只读命令逐条加进 `allow`，写状态的命令进 `deny` |
+| 读到项目外 | 关掉工具 | `allowNonWorkspaceAccess: false`（默认），并用 `regex:` 限定 `find`/`rg` 的作用域 |
+
+### 按任务加白名单
+
+ROM / 固件逆向这类任务，agy 必须能跑以下只读命令，否则必然空响应：
+
+```json
+"command(objdump)", "command(strings)", "command(nm)", "command(readelf)",
+"command(python3)", "command(sha256sum)", "command(file)", "command(xxd)",
+"command(grep)", "command(head)", "command(sed)"
+```
+
+通用分析再补 `command(cat)`、`command(wc)`、`command(tree)`、`command(git *)` 几条。加的时候注意：`command` 默认是 token 前缀匹配，`command(cat)` 会连 `cat /etc/shadow` 一起放行，所以只加真用得上的，并把危险目标排除在 `deny` 里。
+
+### 确实不需要它读代码时
+
+写成「不需要读代码，基于下面给出的事实回答」。这是降低它去读的**动机**，不是保证它不读，也不是命令。真的必须零工具时，就不要用 agy，改用 Pi 自己的模型。
 
 ## 调用故障：三种症状
 
@@ -70,7 +92,7 @@ description: 用 Pi 的 agy_advise 工具向 Antigravity CLI 请求独立分析�
 | 症状 | 机制 | 处置 |
 | --- | --- | --- |
 | 返回的是过程性文字（「我先查看…」「还需检查…」），非空、状态成功 | `agy` 在工具结果后自行结束回合，尚未下判断 | 不要回「继续」。补上它缺的判定条件，或改成「基于以上直接给结论」；连续两次仍如此就拆小问题 |
-| 空响应，错误里附 stderr | 某条命令需要批准，headless 无法弹窗，被 soft-deny，**整轮取消**但进程 exit 0 | 从 stderr 找出具体命令，把该命令加进 `permissions.allow`；不要改 `skipPermissions` |
+| 空响应，错误里附 stderr | 某条命令需要批准，headless 无法弹窗，被 soft-deny，**整轮取消**但进程 exit 0 | 从 stderr 找出具体命令，把它加进 `permissions.allow`；不要因此禁止 agy 用工具，也不要用 `skipPermissions` 绕 |
 | `agy planner timed out after Nms` | 工具反复重试，或思考加输出超出单轮预算 | 拆交付物（见上一节），或把 `timeoutMs` 提到 `300000`；重试时问题必须重新自包含 |
 
 **任何失败都会重置会话。** 空响应、超时、进程退出之后，下一次调用是冷启动，不会带上刚才的上下文。所以「失败后再追问」在机制上不存在，重试那条 `question` 必须自己和一次首问一样完整。只有成功的一轮之后才有热追问。
