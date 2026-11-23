@@ -1,5 +1,5 @@
 // Antigravity Advisor — bridge to the local `agy` CLI.
-// One long-lived `agy` stream-json session in plan mode, exposed to Pi as the
+// One long-lived `agy` stream-json session, exposed to Pi as the agy_advise tool.
 // `agy_advise` tool. The agy process keeps its own conversation and prompt
 // cache; Pi never resends full history — only the question plus optional
 // minimal context. Requires `agy` on PATH and the allow rules in
@@ -80,10 +80,15 @@ export default function (pi: ExtensionAPI) {
   }
 
   function start(cwd: string, skipPermissions: boolean) {
-    // NOTE: --mode plan works by expanding the `/plan` slash command, so it must
-    // NOT be combined with --disable-slash-commands (the CLI then warns
-    // "--mode plan has no effect while slash command expansion is disabled").
-    const args = ["--input-format", "stream-json", "--output-format", "stream-json", "--mode", "plan"];
+    // NOTE: no --mode flag. Plan mode makes agy write an implementation_plan.md
+    // and then wait for a review that headless mode cannot answer, so the turn
+    // ends on "please approve" and no advice is ever returned. Leaving the mode
+    // unset lets the CLI pick its documented headless default (auto since
+    // v1.5.7, falling back to default mode). Passing --mode auto explicitly is
+    // wrong here: on accounts where auto is unavailable the CLI prints
+    // "--mode auto is not available for this account; continuing in the default
+    // mode" on every start.
+    const args = ["--input-format", "stream-json", "--output-format", "stream-json"];
     if (skipPermissions) args.push("--dangerously-skip-permissions");
     if (conversationId) args.push("--conversation", conversationId);
 
@@ -229,7 +234,7 @@ export default function (pi: ExtensionAPI) {
     name: "agy_advise",
     label: "Antigravity Advisor",
     description:
-      "Ask the Antigravity CLI in Plan mode for a plan, design opinion, or independent review. It may read files and run commands to ground the answer; agy's toolPermission preset decides what it may run without asking. Returns advice text.",
+      "Ask the Antigravity CLI for a plan, design opinion, or independent review. It reads files and runs commands to ground the answer; agy's toolPermission preset decides what it may run without asking. Returns advice text.",
     promptSnippet: "Ask the Antigravity planner for a plan or independent second opinion",
     promptGuidelines: [
       "Use agy_advise at decision points: choosing an architecture, being stuck for more than one attempt, before a destructive change, or when an independent second review is wanted. Do not call it inside tight tool loops where it only adds latency.",

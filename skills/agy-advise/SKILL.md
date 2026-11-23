@@ -5,7 +5,7 @@ description: 用 Pi 的 agy_advise 工具向 Antigravity CLI 请求独立分析�
 
 # agy-advise
 
-让 `agy` 根据目标、约束和观察到的证据独立提出方案。扩展在 Plan mode 下调用 `agy`，用于分析和给建议。Plan mode 仍可能写入 CLI 自己的计划文件，文件与命令权限由 `agy` 的配置决定。
+让 `agy` 根据目标、约束和观察到的证据独立提出方案。扩展不传 `--mode`，用 CLI 自己的执行模式默认值。文件与命令权限由 `agy` 的配置决定。
 
 ## 什么时候问
 
@@ -46,13 +46,13 @@ description: 用 Pi 的 agy_advise 工具向 Antigravity CLI 请求独立分析�
 在 `question` 里写「不读取文件、不运行命令、不用工具」，不会生效，还会制造两层冲突：
 
 - 那句话是**调用方模型自己的**操作纪律（不贸然派 worker、不 build、不跑 live、不改仓库），不是在约束 `agy`。写进去等于把 Pi 的行为边界伪装成 agy 的任务定义。
-- Plan 模式本身要求先调查再产出计划。`agy` 会同时在「禁止」与「模式要求」之间找平衡，常见结果是提前结束回合并汇报「检查进度」，或者反复试探直到超时。
+- `agy` 在工具结果之后会自行判断回合可以结束，把「我接下来打算……」当成对提问的完整回答。这是回合边界，不是报错，也不是它的能力问题。
 
 两类约束必须分开：
 
 | 约束谁 | 怎么写 | 为什么 |
 | --- | --- | --- |
-| `agy`：只做只读取证、不改仓库 | 写进 `question`：「只做只读取证，不要改仓库里的任何文件」 | 它仍可能往自己的 brain 目录写 plan 文件，这是 plan 模式的副作用，接受即可 |
+| `agy`：只做只读取证、不改仓库 | 写进 `question`：「只做只读取证，不要改仓库里的任何文件」 | 这是对 agy 行为的要求，但它只是软约束；硬约束靠 `deny` 里的 `write_file(*)` |
 | Pi 自己：不派 worker、不 build、不跑 live、不改 live | **不写进 `question`**，由 Pi 自己在本地执行 | 写进去会让 `agy` 误判任务边界，把「只做静态检查」当成全部任务而提前收尾 |
 
 同理，不要把「先不要贸然动手」这类对 Pi 的自我提醒发给 agy。agy 不知道 Pi 的下一步，看到这种话只会理解成「不要给出可执行结论」。
@@ -65,9 +65,25 @@ description: 用 Pi 的 agy_advise 工具向 Antigravity CLI 请求独立分析�
 
 | 想防的 | 错误做法 | 正确做法 |
 | --- | --- | --- |
-| 乱改文件 | 在 `question` 里禁止工具 | plan 模式 + `artifactReviewPolicy` |
+| 乱改文件 | 在 `question` 里禁止工具 | `write_file(*)` 进 `deny` |
 | 跑危险命令 | 只留 `find`/`ls`/`rg` 白名单 | `toolPermission: "always-proceed"` + `deny` 黑名单 |
 | 读到项目外 | 关掉工具 | `allowNonWorkspaceAccess: false`（默认） |
+
+### 不要用 plan 模式
+
+plan 模式（`--mode plan`）在 headless 下是负收益：它要 agy 先写 `implementation_plan.md`，然后等一个 `artifactReviewPolicy` 的复核，而 headless 现场没有人能批。回合就停在「please review and let me approve」。状态是 `SUCCESS`、`response` 非空，扩展不会报错，Pi 只拿到一段过程性文字，这正是「只返回检查进度」的成因。
+
+另有两个附带代价：plan 模式靠展开 `/plan` 斜杠命令实现，和 `--disable-slash-commands` 直接冲突；每轮还多写一份计划文件、多花 thinking。
+
+所以：**不传 `--mode`**。CLI 用它的 headless 默认值（v1.5.7+ 为 `auto`，不可用则 `default`）。本机实测 `auto` 对本账号不可用，会回落到 `default`：
+
+```
+warning: --mode auto is not available for this account; continuing in the default mode.
+```
+
+实测同一会话不传 `--mode`：`uname -srm` 一条命令 25.7 秒返回 `Linux 7.3.5-arch1-1 x86_64`，brain 目录里没有生成 `implementation_plan.md`，`total_tokens` 11019。
+
+如果确实看到 agy 停下来请示，回一句明确的「Approved, proceed now」就能解除——它把这句话当成批准，同一会话里会直接继续。
 
 ### 不维护白名单：用预设 + 黑名单
 

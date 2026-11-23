@@ -3,7 +3,7 @@
 把本机的 [Antigravity CLI](https://antigravity.google/docs/cli)（`agy`）接成一个 Pi 工具：**`agy_advise`**。
 Pi 在需要方案、设计意见或第二次审查时问它一句，agy 在自己的会话里读代码、给建议，把文本返回给 Pi。
 
-以 Plan mode 提供规划和审查建议。文件和命令访问由 Antigravity 的权限设置控制。
+以执行模式默认值提供规划和审查建议（不传 `--mode`）。文件和命令访问由 Antigravity 的权限设置控制。
 
 > A Pi extension that exposes the local `agy` (Antigravity CLI) as a planning advisor.
 
@@ -12,7 +12,7 @@ Pi 在需要方案、设计意见或第二次审查时问它一句，agy 在自�
 每次都 `agy -p` 等于每轮从零开始：重新读文件、重新建立上下文、重复计费。本扩展改成**一个长驻的 `agy` 进程**讲 stream-json：
 
 ```
-Pi ──agy_advise(question)──▶ 长驻 agy 进程（plan mode, stream-json）
+Pi ──agy_advise(question)──▶ 长驻 agy 进程（默认模式, stream-json）
                                   │  自己维护会话与 prompt cache
    ◀──────── 建议文本 ─────────────┘
 ```
@@ -116,8 +116,10 @@ skill 随本仓库发布在 `skills/agy-advise/SKILL.md`：
 
 ## 行为与已知限制
 
-- `--mode plan` 通过 `/plan` 启用规划，agy 仍可能在 `~/.gemini/antigravity-cli/brain/<conversation_id>/` 写计划文件。工作区访问由 Antigravity 的权限设置控制。经过用户明确授权的 `skipPermissions` 会跳过常规工具审批。
-- **`--mode plan` 与 `--disable-slash-commands` 互斥**。同时传入 agy 会警告 `--mode plan has no effect while slash command expansion is disabled`，plan 形同虚设。本扩展只传前者。
+- **不传 `--mode`，更不用 `--mode plan`**。plan 模式会让 agy 先写 `implementation_plan.md` 再等复核；headless 无法回应复核，回合就停在「please approve」上，顾问永远交不出答案。不传时 CLI 用它自己的 headless 默认值（v1.5.7+ 是 `auto`，不可用则 `default`）。
+- **别显式传 `--mode auto`**。本机账号实测返回 `warning: --mode auto is not available for this account; continuing in the default mode.`（该模式排除企业与商业账号），每次启动都多一行 stderr 噪声。
+- 写保护靠权限设置（把 `write_file(*)` 加进 `deny`），不靠模式：`default` 模式的交互式 diff 复核在 headless 里没人能批，效果是写文件动作被 soft-deny。
+- 任何需要批准但拿不到的工具动作都会被 soft-deny：整轮取消，退出码仍是 0。扩展把空 response 当错误抛出并附 stderr。
 - **会话内不能发斜杠命令**。`/model`、`/usage` 之类在 stream-json 会话里会直接报错退出（exit 2）。
 - **成本**：一次多文件分析实测约 12 万 token 以内、100 秒上下；简单问答 20–40 秒。agy 会话独立于 Pi，第一条问题务必自包含。
 - **`agy` 的输出不会流式显示**，工具返回时一次性给出完整文本。
