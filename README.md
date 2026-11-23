@@ -92,6 +92,20 @@ headless 模式没法弹确认框。一旦 agy 想跑一条需要批准的命令
 
 ## 怎么问才不浪费
 
+> **必须同时装 `agy-advise` skill。** 扩展里的 `promptGuidelines` 只能拦住“不要把问题预先坍缩成两项”这一件事；完整的提问范式（四段式模板、反模式对照、故障排查、成本表）写在 skill 里。只装扩展、不装 skill，能避开最明显的错，但拿不到正确用法。
+
+skill 随本仓库发布在 `skills/agy-advise/SKILL.md`：
+
+- 用 `pi install` 装包时，它由 `package.json` 的 `pi.skills` 一起装入，不用管
+- 手动拷贝 `index.ts` 的话，记得同样拷一份：
+
+  ```bash
+  mkdir -p ~/.agents/skills/agy-advise
+  cp skills/agy-advise/SKILL.md ~/.agents/skills/agy-advise/
+  ```
+
+装完后 `/reload`，技能名就是 `agy-advise`；需要强制时用 `/skill:agy-advise`。
+
 agy 是本机最强的模型，**别把它当选项打分器**。工具的 `promptGuidelines` 里写死了这条约束，但提问的人（模型）仍要自觉：
 
 - 不要先把问题坍缩成 A/B/C 再让它选。给目标、约束、已尝试、失败现象，让它自己划定方案空间。
@@ -99,7 +113,7 @@ agy 是本机最强的模型，**别把它当选项打分器**。工具的 `prom
 - 不要把 Pi 自己的推理链粘进 `context`。只给 agy 看不到的事实。
 - 事实类问题（某个函数有没有加锁）自己 `grep`，别花 100 秒让它重读。
 
-配套的提问规范见 [`agy-advise` skill](https://github.com/fishing-dev-sm/pi-agy_advise)，含四段式模板与反模式对照。
+配套的提问规范见本仓库的 [`agy-advise` skill](skills/agy-advise/SKILL.md)，含四段式模板与反模式对照。
 
 另外，扩展会在每次提问末尾追加一句固定要求：若问题里已带候选方案，不要简单挑一个，而是自己推导最佳解并说明理由。这是对“被喂选择题”的对冲，不是给 agy 加人设。
 
