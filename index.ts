@@ -148,11 +148,12 @@ export default function (pi: ExtensionAPI) {
     name: "agy_advise",
     label: "Antigravity Advisor",
     description:
-      "Ask the Antigravity CLI agent (plan mode, read-only) for a plan, design opinion, or second review. Returns advice text only; it never edits files.",
+      "Ask the Antigravity CLI agent (plan mode, read-only) for a plan, design opinion, or second review. It is the strongest model available here: hand it open questions. Returns advice text only; it never edits files.",
     promptSnippet: "Ask the Antigravity planner for a plan or second opinion (read-only)",
     promptGuidelines: [
-      "Use agy_advise at decision points: choosing an architecture, being stuck, before a destructive change, or when a second review is wanted. Do not call it inside tight tool loops where it only adds latency.",
-      "agy_advise does not share Pi's conversation history; pass a self-contained question plus the minimal context agy cannot see.",
+      "Use agy_advise at decision points: choosing an architecture, being stuck, before a destructive change, or when an independent second review is wanted. Do not call it inside tight tool loops where it only adds latency.",
+      "Never pre-collapse the problem for agy_advise. Do not hand it candidate options (A/B/C, \"option 1 or 2\") or your own conclusion to approve. agy is the strongest model here: give it the goal, the constraints, and the observed failure, then let it choose the solution space.",
+      "Keep agy_advise input factual. Pass the facts agy cannot see (paths, error text, constraints) and one line per hypothesis already ruled out. Do not paste Pi's own reasoning chain or ask agy to re-read files Pi already read.",
     ],
     parameters: Type.Object({
       question: Type.String({ description: "The decision or question, self-contained" }),
@@ -167,8 +168,11 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, p, signal, _onUpdate, ctx) {
       // Send the question as a plain request. Read-only behaviour comes from
-      // `--mode plan`, not from instructions inside the prompt.
-      const prompt = p.context ? `${p.question}\n\nKnown context:\n${p.context}` : p.question;
+      // `--mode plan`, not from instructions inside the prompt. The trailing
+      // sentence counteracts the common failure mode of handing agy a
+      // pre-collapsed choice: it is told to derive the answer itself.
+      const asked = p.context ? `${p.question}\n\nKnown context:\n${p.context}` : p.question;
+      const prompt = `${asked}\n\nAnswer from first principles. If the question already offers candidate options or a proposed approach, do not simply pick one: derive what you think is right from the goal, the constraints, and the observed failures, and say why.`;
 
       const run = () => ask(prompt, p.timeoutMs ?? 240_000, ctx.cwd, p.skipPermissions === true, signal);
       const result = chain.then(run, run);
