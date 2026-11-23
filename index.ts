@@ -231,9 +231,9 @@ export default function (pi: ExtensionAPI) {
       "Ask the Antigravity CLI in Plan mode for a plan, design opinion, or independent review. Returns advice text. Antigravity's permission settings control tool and workspace access.",
     promptSnippet: "Ask the Antigravity planner for a plan or independent second opinion",
     promptGuidelines: [
-      "Use agy_advise for architectural decisions, persistent blockers, planning a destructive change, or independent review. Keep it out of tight tool loops.",
-      "Give agy the goal, constraints, observed failure, and an open question. Leave the solution space open for an independent assessment.",
-      "Use context for facts agy otherwise lacks, such as paths, hard constraints, and evidence ruling out earlier attempts. Keep it short.",
+      "Use agy_advise at decision points: choosing an architecture, being stuck for more than one attempt, before a destructive change, or when an independent second review is wanted. Do not call it inside tight tool loops where it only adds latency.",
+      "Never pre-collapse the problem for agy_advise. Do not hand it candidate options (A/B/C, \"option 1 or 2\") and do not give it your own conclusion to approve. agy is the strongest model available here: give it the goal, the constraints, and the observed failure, then let it choose the solution space.",
+      "Keep agy_advise input factual. Pass the facts agy cannot see (paths, error text, constraints) and one line per hypothesis already ruled out. Do not paste Pi's own reasoning chain, and do not ask agy to re-read files Pi already read.",
       "Set skipPermissions to true only when the user explicitly authorizes the permission bypass for this request. If a permission problem occurs, explain the blocked operation when the diagnostics identify it.",
     ],
     parameters: Type.Object({
