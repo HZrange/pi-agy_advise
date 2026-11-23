@@ -3,9 +3,9 @@
 把本机的 [Antigravity CLI](https://antigravity.google/docs/cli)（`agy`）接成一个 Pi 工具：**`agy_advise`**。
 Pi 在需要方案、设计意见或第二次审查时问它一句，agy 在自己的会话里读代码、给建议，把文本返回给 Pi。
 
-Plan mode，只出主意，不改你的文件。
+以 Plan mode 提供规划和审查建议。文件和命令访问由 Antigravity 的权限设置控制。
 
-> A Pi extension that exposes the local `agy` (Antigravity CLI) as a read-only planning advisor.
+> A Pi extension that exposes the local `agy` (Antigravity CLI) as a planning advisor.
 
 ## 为什么不是一个简单的 `agy -p`
 
@@ -20,7 +20,8 @@ Pi ──agy_advise(question)──▶ 长驻 agy 进程（plan mode, stream-jso
 - Pi 侧只发 `question`（可选一条 `context`），**不重传 Pi 的对话历史**。历史在 agy 那边。
 - 连续提问复用同一个 `conversation_id`，agy 的 prompt cache 因此持续命中。实测同一会话第二轮：`cache_read_tokens: 32973 / total_tokens: 36090`（约 91% 命中）。
 - 请求串行化，不会把 agy 的 stdin 写乱。
-- 空闲 10 分钟自动回收进程；超时（默认 240s）或进程崩溃后，下次调用自动用原 `conversation_id` 续上。
+- 每轮成功后开始计算空闲时间，空闲满 10 分钟回收进程。切换工作目录、空闲回收、失败、超时或进程退出后，下次调用会创建新会话。
+- 在同一目录里切换权限时，扩展会重启活跃进程并沿用会话 ID。
 
 ## 安装
 
@@ -43,7 +44,7 @@ pi install git:github.com/fishing-dev-sm/pi-agy_advise
 
 ## 前置：给 agy 开权限白名单
 
-headless 模式没法弹确认框。一旦 agy 想跑一条需要批准的命令（它常先 `find`/`ls` 看仓库结构），**整轮会被静默取消：进程 exit 0、status 仍是 SUCCESS、响应是空字符串**。这是本扩展最容易踩的坑，所以它把空响应当错误抛出，而不是返回空文本。
+headless 模式没法弹确认框。命令需要批准时，`agy` 可能返回状态为 `SUCCESS` 的空回复。扩展会将空回复作为错误返回，并在 stderr 有输出时附上诊断。
 
 在 `~/.gemini/antigravity-cli/settings.json` 里加只读命令的 allow 规则：
 
@@ -77,10 +78,10 @@ headless 模式没法弹确认框。一旦 agy 想跑一条需要批准的命令
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `question` | ✅ | 问题本身，必须自包含：agy 看不到 Pi 的对话历史 |
+| `question` | ✅ | 目标、相关失败现象和开放问题。首轮应自包含，同一活跃会话的追问可增量提供 |
 | `context` | — | agy 看不到、但回答必需的最小事实。省略可省钱 |
 | `timeoutMs` | — | 单次问答超时，默认 240000 |
-| `skipPermissions` | — | 传 `--dangerously-skip-permissions`。仅在没配 allow 规则时应急使用 |
+| `skipPermissions` | — | 传 `--dangerously-skip-permissions`，可能允许执行命令和修改文件。只有用户明确授权本次调用才能设为 `true` |
 
 在 Pi 里直接说人话即可，Pi 会自己决定何时调用，例如：
 
@@ -92,7 +93,7 @@ headless 模式没法弹确认框。一旦 agy 想跑一条需要批准的命令
 
 ## 怎么问才不浪费
 
-> **必须同时装 `agy-advise` skill。** 扩展里的 `promptGuidelines` 只能拦住“不要把问题预先坍缩成两项”这一件事；完整的提问范式（四段式模板、反模式对照、故障排查、成本表）写在 skill 里。只装扩展、不装 skill，能避开最明显的错，但拿不到正确用法。
+安装扩展时请同时安装配套的 [`agy-advise` skill](skills/agy-advise/SKILL.md)。它包含提问、验证建议和故障排查的完整用法。
 
 skill 随本仓库发布在 `skills/agy-advise/SKILL.md`：
 
@@ -106,20 +107,18 @@ skill 随本仓库发布在 `skills/agy-advise/SKILL.md`：
 
 装完后 `/reload`，技能名就是 `agy-advise`；需要强制时用 `/skill:agy-advise`。
 
-agy 是本机最强的模型，**别把它当选项打分器**。工具的 `promptGuidelines` 里写死了这条约束，但提问的人（模型）仍要自觉：
+给 agy 一个开放问题，让它根据目标、约束和已观察到的现象找方案。
 
 - 不要先把问题坍缩成 A/B/C 再让它选。给目标、约束、已尝试、失败现象，让它自己划定方案空间。
 - 不要先给结论再问“对不对”。那只会得到一个 yes。
 - 不要把 Pi 自己的推理链粘进 `context`。只给 agy 看不到的事实。
 - 事实类问题（某个函数有没有加锁）自己 `grep`，别花 100 秒让它重读。
 
-配套的提问规范见本仓库的 [`agy-advise` skill](skills/agy-advise/SKILL.md)，含四段式模板与反模式对照。
-
 另外，扩展会在每次提问末尾追加一句固定要求：若问题里已带候选方案，不要简单挑一个，而是自己推导最佳解并说明理由。这是对“被喂选择题”的对冲，不是给 agy 加人设。
 
 ## 行为与已知限制
 
-- **plan 模式不等于强制只读**。`--mode plan` 的实现方式是展开 `/plan` 斜杠命令，agy 仍会往 `~/.gemini/antigravity-cli/brain/<conversation_id>/implementation_plan.md` 写计划文件；配合 `skipPermissions` 时它也可能改动工作区文件。本扩展不使用 `--dangerously-skip-permissions`，除非你显式传参。
+- `--mode plan` 通过 `/plan` 启用规划，agy 仍可能在 `~/.gemini/antigravity-cli/brain/<conversation_id>/` 写计划文件。工作区访问由 Antigravity 的权限设置控制。经过用户明确授权的 `skipPermissions` 会跳过常规工具审批。
 - **`--mode plan` 与 `--disable-slash-commands` 互斥**。同时传入 agy 会警告 `--mode plan has no effect while slash command expansion is disabled`，plan 形同虚设。本扩展只传前者。
 - **会话内不能发斜杠命令**。`/model`、`/usage` 之类在 stream-json 会话里会直接报错退出（exit 2）。
 - **成本**：一次多文件分析实测约 12 万 token 以内、100 秒上下；简单问答 20–40 秒。agy 会话独立于 Pi，第一条问题务必自包含。
