@@ -65,21 +65,34 @@ description: 用 Pi 的 agy_advise 工具向 Antigravity CLI 请求独立分析�
 
 | 想防的 | 错误做法 | 正确做法 |
 | --- | --- | --- |
-| 乱改文件 | 在 `question` 里禁止工具 | plan 模式 + `artifactReviewPolicy` + 危险命令进 `deny` |
-| 跑危险命令 | 只留 `find`/`ls`/`rg` | 只读命令逐条加进 `allow`，写状态的命令进 `deny` |
-| 读到项目外 | 关掉工具 | `allowNonWorkspaceAccess: false`（默认），并用 `regex:` 限定 `find`/`rg` 的作用域 |
+| 乱改文件 | 在 `question` 里禁止工具 | plan 模式 + `artifactReviewPolicy` |
+| 跑危险命令 | 只留 `find`/`ls`/`rg` 白名单 | `toolPermission: "always-proceed"` + `deny` 黑名单 |
+| 读到项目外 | 关掉工具 | `allowNonWorkspaceAccess: false`（默认） |
 
-### 按任务加白名单
+### 不维护白名单：用预设 + 黑名单
 
-ROM / 固件逆向这类任务，agy 必须能跑以下只读命令，否则必然空响应：
+逐条 `allow` 是错的方向：新增任务就要重新扫一遍命令，漏一条就变成一次空响应。把一个总开关打开、把危险操作关掉，维护量接近零：
 
 ```json
-"command(objdump)", "command(strings)", "command(nm)", "command(readelf)",
-"command(python3)", "command(sha256sum)", "command(file)", "command(xxd)",
-"command(grep)", "command(head)", "command(sed)"
+{
+  "toolPermission": "always-proceed",
+  "permissions": {
+    "deny": [
+      "command(rm)", "command(sudo)", "command(dd)", "command(chmod)",
+      "command(chown)", "command(mkfs)", "command(shutdown)"
+    ]
+  }
+}
 ```
 
-通用分析再补 `command(cat)`、`command(wc)`、`command(tree)`、`command(git *)` 几条。加的时候注意：`command` 默认是 token 前缀匹配，`command(cat)` 会连 `cat /etc/shadow` 一起放行，所以只加真用得上的，并把危险目标排除在 `deny` 里。
+官方文档对 `always-proceed` 的定义是：终端命令、网页请求、MCP 工具都无需询问，**除了命中 ask 或 deny 规则的**。也就是说 deny 在 every mode 下仍然生效，黑名单是最后一道闸。
+
+两个代价要清楚：
+
+- 这是全局设置，**你手工用 agy 时它也不再询问写文件或跑命令**。
+- 它不限制范围。`objdump /any/path` 一样放行，靠的是工作区之外默认不可访问（`allowNonWorkspaceAccess: false`）。
+
+要保留逐条审批就把 `toolPermission` 换成 `request-review`；但在 headless 下那等于退回到「一条命令没列进 allow 就整轮空」。`proceed-in-sandbox` 是中间选项，只在 Sandbox Mode 真正生效时有用；Linux 上若内核对 unprivileged user namespace 限制，它会退化成 `request-review`。
 
 ### 确实不需要它读代码时
 
@@ -92,7 +105,7 @@ ROM / 固件逆向这类任务，agy 必须能跑以下只读命令，否则必�
 | 症状 | 机制 | 处置 |
 | --- | --- | --- |
 | 返回的是过程性文字（「我先查看…」「还需检查…」），非空、状态成功 | `agy` 在工具结果后自行结束回合，尚未下判断 | 不要回「继续」。补上它缺的判定条件，或改成「基于以上直接给结论」；连续两次仍如此就拆小问题 |
-| 空响应，错误里附 stderr | 某条命令需要批准，headless 无法弹窗，被 soft-deny，**整轮取消**但进程 exit 0 | 从 stderr 找出具体命令，把它加进 `permissions.allow`；不要因此禁止 agy 用工具，也不要用 `skipPermissions` 绕 |
+| 空响应，错误里附 stderr | 某条命令需要批准，headless 无法弹窗，被 soft-deny，**整轮取消**但进程 exit 0 | 确认 `toolPermission` 不是 `request-review`；若是，改成 `always-proceed`。不要因此禁止 agy 用工具 |
 | `agy planner timed out after Nms` | 工具反复重试，或思考加输出超出单轮预算 | 拆交付物（见上一节），或把 `timeoutMs` 提到 `300000`；重试时问题必须重新自包含 |
 
 **任何失败都会重置会话。** 空响应、超时、进程退出之后，下一次调用是冷启动，不会带上刚才的上下文。所以「失败后再追问」在机制上不存在，重试那条 `question` 必须自己和一次首问一样完整。只有成功的一轮之后才有热追问。
@@ -103,7 +116,7 @@ ROM / 固件逆向这类任务，agy 必须能跑以下只读命令，否则必�
 
 1. 判断症状属于上表哪一种，先不要重复调用。
 2. 空响应或超时：查 stderr 或上一次工具序列，确认是不是权限问题。
-3. 权限问题：加一条最小 allow 规则，再重试一次，仍失败就报告用户，不要连续重试。
+3. 权限问题：先看 `toolPermission`，headless 下应设为 `always-proceed`；再重试一次，仍失败就报告用户，不要连续重试。
 4. 连续两次失败：停止调用 `agy_advise`，把症状、stderr 原文和已试过的处置告诉用户，由用户决定是否继续。
 
 ## 冷启动和热追问

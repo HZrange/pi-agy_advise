@@ -42,21 +42,16 @@ cp pi-agy_advise/index.ts ~/.pi/agent/extensions/
 pi install git:github.com/fishing-dev-sm/pi-agy_advise
 ```
 
-## 前置：给 agy 开权限白名单
+## 前置：把 agy 的权限开关打开
 
-headless 模式没法弹确认框。命令需要批准时，`agy` 可能返回状态为 `SUCCESS` 的空回复。扩展会将空回复作为错误返回，并在 stderr 有输出时附上诊断。
+headless 模式没法弹确认框。只要有一条命令需要批准，`agy` 就会取消整轮，返回状态为 `SUCCESS` 的空回复。扩展把空回复当错误抛出，并附上 stderr 诊断。
 
-在 `~/.gemini/antigravity-cli/settings.json` 里加只读命令的 allow 规则：
+维护逐条 `allow` 白名单是错的方向：每换一个任务就要重新扫一遍命令，漏一条就是一次空响应。改用一个总开关加一份危险操作黑名单：
 
 ```json
 {
+  "toolPermission": "always-proceed",
   "permissions": {
-    "allow": [
-      "command(find)", "command(ls)", "command(pwd)", "command(tree)",
-      "command(wc)", "command(rg)",
-      "command(git status)", "command(git log)", "command(git diff)",
-      "command(git show)", "command(git ls-files)", "command(git rev-parse)"
-    ],
     "deny": [
       "command(rm)", "command(sudo)", "command(dd)",
       "command(chmod)", "command(chown)", "command(mkfs)", "command(shutdown)"
@@ -65,12 +60,15 @@ headless 模式没法弹确认框。命令需要批准时，`agy` 可能返回�
 }
 ```
 
-规则语法见官方 [Agent permissions](https://antigravity.google/docs/permissions)：形如 `action(target)`，`command` 按 token 前缀匹配，优先级 **Deny > Ask > Allow**。
+写进 `~/.gemini/antigravity-cli/settings.json`。官方对 `always-proceed` 的定义是：终端命令、网页请求、MCP 工具都不询问，**但命中 ask 或 deny 规则的仍然拦**。所以黑名单在每种模式下都生效（官方 [settings](https://antigravity.google/docs/settings)、[Agent permissions](https://antigravity.google/docs/permissions)）。
 
-两个必须知道的边界：
+三个必须知道的边界：
 
-1. 这些是 **global scope** 规则，对交互式 `agy` 同样生效。
-2. 规则只匹配命令名，管不住范围：`find` 允许 `find /`，`rg` 允许 `rg -uu /`。`deny` 也只是兜底——`bash -c "rm -rf x"` 的首 token 是 `bash`，不会命中 `command(rm)`。要硬隔离请开 `enableTerminalSandbox`。
+1. `toolPermission` 是 **global** 的，你手工用 `agy` 时它也不再询问写文件和跑命令。
+2. 它不管范围：`objdump /any/path` 一样放行；范围靠工作区之外默认不可访问（`allowNonWorkspaceAccess: false`）。
+3. `deny` 只能拦首 token：`bash -c "rm -rf x"` 首 token 是 `bash`，不会命中 `command(rm)`。要硬隔离请开 `enableTerminalSandbox`，并改用 `proceed-in-sandbox`——但 Linux 上内核对 unprivileged user namespace 的限制会让它退化成 `request-review`，先验证再用。
+
+不想全局放开，可以保留默认的 `request-review`，但那就得回到逐条 `allow`，并接受漏列即空响应。
 
 ## 用法
 
@@ -81,7 +79,7 @@ headless 模式没法弹确认框。命令需要批准时，`agy` 可能返回�
 | `question` | ✅ | 目标、相关失败现象和开放问题。首轮应自包含，同一活跃会话的追问可增量提供 |
 | `context` | — | agy 看不到、但回答必需的最小事实。省略可省钱 |
 | `timeoutMs` | — | 单次问答超时，默认 240000 |
-| `skipPermissions` | — | 传 `--dangerously-skip-permissions`，可能允许执行命令和修改文件。只有用户明确授权本次调用才能设为 `true` |
+| `skipPermissions` | — | 传 `--dangerously-skip-permissions`。仅当 `agy` 侧没有放开 `toolPermission` 时需要，仍需用户明确授权本次调用 |
 
 在 Pi 里直接说人话即可，Pi 会自己决定何时调用，例如：
 
