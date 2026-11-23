@@ -1,0 +1,24 @@
+{
+  "name": "pi-agy_advise",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi extension: use the local Antigravity CLI (agy) as a read-only planning advisor.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "antigravity",
+    "agy",
+    "planner",
+    "advisor"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
