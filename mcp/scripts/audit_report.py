@@ -34,6 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     summary_cmd.add_argument("--project", default=None, help="Filter by project_id.")
     summary_cmd.add_argument("--days", type=int, default=None, help="Only include records from the last N days.")
+    summary_cmd.add_argument("--since", default=None, help="Only include records at or after ISO timestamp (UTC).")
+    summary_cmd.add_argument("--after-line", type=int, default=None, help="Only include records starting from 1-based line N.")
     summary_cmd.add_argument("--recent", type=int, default=10, help="Number of recent calls to display.")
     summary_cmd.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON instead of Markdown.")
 
@@ -84,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         db_path=effective_db,
         project_id=args.project,
         days=args.days,
+        since=args.since,
+        after_line=args.after_line,
         recent=args.recent,
     )
     if args.as_json:

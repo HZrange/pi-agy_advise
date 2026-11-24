@@ -22,22 +22,30 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from project import (  # noqa: E402
     Activate,
+    DECISION_JSON_SCHEMA,
+    DIRECTIVE_REVIEW_JSON_SCHEMA,
     Decision,
+    Directive,
     Initialize,
     L3_DETAILED_TRIALS,
     L3_EVIDENCE_CHARS,
     L3_RECENT_DECISIONS,
     L3_SUMMARY_TRIALS,
     ListProjects,
+    MAX_GOVERNANCE_NOTES,
     MAX_VERIFIED_FACTS,
+    ProjectFeedback,
     ProjectStore,
     Report,
     Review,
     Status,
+    Suspend,
     UpdateMemory,
+    build_advisor_track_record,
     build_efficiency_scorecard,
     build_three_tier_packet,
     decode_decision,
+    decode_directive_review,
     handle_project,
     public,
     render_markdown_summary,
@@ -53,7 +61,7 @@ class FakeAdvisor:
         self.responses = list(responses)
         self.calls = []
 
-    async def ask(self, prompt, session_id, timeout, effort=None, model=None):
+    async def ask(self, prompt, session_id, timeout, effort=None, model=None, json_schema=None):
         self.calls.append(
             {
                 "prompt": prompt,
@@ -61,6 +69,7 @@ class FakeAdvisor:
                 "timeout": timeout,
                 "effort": effort,
                 "model": model,
+                "json_schema": json_schema,
             }
         )
         outcome = self.responses.pop(0)
@@ -74,6 +83,8 @@ class FakeAdvisor:
             "duration_seconds": 1.2,
             "usage": {"total_tokens": 100},
             "model_reported": "fake-model",
+            "model_configured": model or "fake-default",
+            "prompt_chars": len(prompt),
             "queue_seconds": 0.0,
             "elapsed_seconds": 1.2,
             "requested_effort": effort,
@@ -680,6 +691,34 @@ class FakeCliStreamingTests(IsolatedAsyncioTestCase):
                 r2 = await advisor.ask(p2, r1["session_id"], 10)
                 self.assertEqual(r2["advice"], "FOLLOWUP_OK")
                 self.assertEqual(r2["session_id"], r1["session_id"])
+            finally:
+                await advisor.stop()
+
+    async def test_advisor_fails_fast_on_interactive_auth_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hung_auth_cli = Path(tmp) / "fake_agy_auth_hang.py"
+            hung_auth_cli.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys, time
+                    sys.stderr.write("Authentication required. Please visit the URL to log in:\\n")
+                    sys.stderr.flush()
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            hung_auth_cli.chmod(hung_auth_cli.stat().st_mode | stat.S_IXUSR)
+
+            advisor = Advisor(str(hung_auth_cli), tmp)
+            t0 = asyncio.get_running_loop().time()
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    await advisor.ask("Hello", None, 20)
+                elapsed = asyncio.get_running_loop().time() - t0
+                self.assertIn("authenticated session", str(ctx.exception))
+                self.assertLess(elapsed, 4.0)
             finally:
                 await advisor.stop()
 
@@ -1319,7 +1358,468 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
         self.assertEqual(summary["llm_attempted_invocations"], 6)
         self.assertEqual(summary["llm_invocations"], 5)
         self.assertEqual(summary["llm_responded_invocations"], 5)
+        self.assertEqual(sum(summary["models"].values()), summary["llm_invocations"])
         self.assertTrue(any("tactical Q&A share" in hint for hint in summary["tuning_hints"]))
+
+    async def test_directive_contrarian_check_dissent_override_and_outcome_attribution(self):
+        init_evt = Initialize(
+            id="cmdr",
+            phase="p1",
+            action="init",
+            objective="Raise gate from 2 to 7",
+            frozen_gate="Dynamic >= 7/8",
+            non_negotiables=["Preserve static protection"],
+            budget_envelope={"train_steps": 10000, "eval_steps": 5000},
+            score_name="dynamic",
+            baseline_score=2,
+            pass_score=7,
+            route="baseline-route",
+        )
+        caution_reply = json.dumps(
+            {
+                "alignment": "caution",
+                "verdict_summary": "Reasonable to try with strict early stop.",
+                "dissent_points": [],
+                "fatal_assumptions": ["Teacher recovers from real student OOD states"],
+                "cheapest_falsifier": "Run 5-seed teacher takeover before training",
+                "recommended_guardrails": ["Stop if teacher takeover < 3/5"],
+                "suggested_max_trials": 3,
+            }
+        )
+        dissent_reply = json.dumps(
+            {
+                "alignment": "dissent",
+                "verdict_summary": "Reusing v3 zero-train repeats known yaw bottleneck.",
+                "dissent_points": ["v3 already scored 1/8 due to slow yaw response"],
+                "fatal_assumptions": ["Reference swap alone fixes closed-loop yaw lag"],
+                "cheapest_falsifier": "Single frozen-8 eval before spending training budget",
+                "alternative_path": "Closed-loop DAgger with student rollouts",
+                "recommended_guardrails": ["Cap at 1 frozen eval"],
+                "suggested_max_trials": 2,
+            }
+        )
+        hold_reply = json.dumps(
+            {
+                "decision": "HOLD",
+                "why": "Overridden v3 route stayed at 1/8.",
+                "main_bottleneck": "Yaw response lag",
+                "contrarian_check": "Continuing zero-train tweaks is a local optimum.",
+                "unblock_actions": ["Switch to closed-loop training"],
+                "unblock_criteria": "Approved closed-loop training budget",
+            }
+        )
+        dissent_reply_2 = json.dumps(
+            {
+                "alignment": "dissent",
+                "verdict_summary": "Skeptical of sparse reward variant.",
+                "dissent_points": ["Prior sparse reward had 0 triggers"],
+                "fatal_assumptions": ["Shaping density is sufficient"],
+                "cheapest_falsifier": "Verify non-zero trigger rate in 1k steps",
+                "alternative_path": "Dense imitation + RL hybrid",
+                "recommended_guardrails": ["Abort if trigger rate == 0"],
+                "suggested_max_trials": 2,
+            }
+        )
+        advisor = FakeAdvisor([caution_reply, dissent_reply, hold_reply, dissent_reply_2])
+        await execute_advise(store=self.store, advisor=advisor, project=init_evt)
+
+        # 1. Directive with alignment='caution' updates budget_envelope and auto-activates immediately!
+        d1 = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Directive(
+                id="cmdr",
+                phase="p1",
+                action="directive",
+                directive="Approve 30k train steps and try DAgger takeover.",
+                budget_envelope={"train_steps": 30000, "eval_steps": 24100},
+                route="dagger-takeover",
+                hypothesis_family="closed-loop-dagger",
+                max_trials=3,
+            ),
+        )
+        self.assertEqual(d1["review_status"], "decided")
+        self.assertEqual(d1["directive_alignment"], "caution")
+        self.assertFalse(d1["dissent_raised"])
+        self.assertTrue(d1["project"]["dispatch_allowed"])
+        self.assertEqual(d1["project"]["route"], "dagger-takeover")
+        self.assertEqual(d1["project"]["budget_envelope"]["train_steps"], 30000)
+        self.assertEqual(advisor.calls[0]["json_schema"], DIRECTIVE_REVIEW_JSON_SCHEMA)
+
+        # 2. Directive with alignment='dissent' pauses dispatch so human sees objection!
+        d2 = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Directive(
+                id="cmdr",
+                phase="p1",
+                action="directive",
+                directive="Try zero-train v3 reference swap anyway.",
+                route="v3-ref-swap",
+                max_trials=1,
+            ),
+        )
+        self.assertEqual(d2["directive_alignment"], "dissent")
+        self.assertTrue(d2["dissent_raised"])
+        self.assertFalse(d2["project"]["dispatch_allowed"])
+        self.assertIn("advisor_dissent", d2["project"]["review_reasons"])
+
+        # Human explicitly overrides dissent via Activate -> marks human_overrode_dissent=True
+        act = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Activate(id="cmdr", phase="p1", action="activate", decision_id=d2["project"]["last_decision"]["id"]),
+        )
+        self.assertTrue(act["project"]["dispatch_allowed"])
+        self.assertTrue(act["project"]["active_plan"]["human_overrode_dissent"])
+
+        # Overridden route scores 1.0 (fails to beat 2.0) -> HOLD -> dissent_vindicated!
+        rep = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Report(
+                id="cmdr",
+                phase="p1",
+                action="report",
+                trial_id="v3-eval-1",
+                route="v3-ref-swap",
+                cycle=act["project"]["cycle"],
+                mechanism="ref-swap",
+                score=1.0,
+                evidence="Still 1/8 on frozen gate.",
+            ),
+        )
+        self.assertEqual(rep["project"]["phase_status"], "held")
+        tr = rep["project"]["track_record"]
+        self.assertEqual(tr["dissent_vindicated"], 1)
+        self.assertEqual(tr["dissent_refuted"], 0)
+
+        # 3. Override dissent via override_dissent=True, then beat score -> dissent_refuted!
+        d3 = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Directive(
+                id="cmdr",
+                phase="p1",
+                action="directive",
+                directive="Run sparse reward v2 anyway.",
+                route="sparse-v2",
+                max_trials=2,
+                override_dissent=True,
+            ),
+        )
+        self.assertTrue(d3["dissent_raised"])
+        self.assertTrue(d3["project"]["dispatch_allowed"])
+        await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Report(
+                id="cmdr",
+                phase="p1",
+                action="report",
+                trial_id="sparse-win",
+                route="sparse-v2",
+                cycle=d3["project"]["cycle"],
+                mechanism="sparse-r",
+                score=5.0,
+                evidence="Jumped to 5/8!",
+                auto_review=False,
+            ),
+        )
+        sus = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Suspend(id="cmdr", phase="p1", action="suspend", reason="Closing test phase"),
+        )
+        self.assertEqual(sus["project"]["track_record"]["dissent_refuted"], 1)
+
+    async def test_hold_blocks_shadow_dispatch_allows_unblock_check_and_suspend_lifecycle(self):
+        init_evt = Initialize(
+            id="holdtest",
+            phase="p1",
+            action="init",
+            objective="Pass 7/8",
+            frozen_gate="Dynamic >= 7/8",
+            score_name="dyn",
+            baseline_score=2,
+            pass_score=7,
+            stagnation_limit=1,
+            route="r1",
+        )
+        hold_json = json.dumps(
+            {
+                "decision": "HOLD",
+                "why": "Need root-cause attribution first.",
+                "main_bottleneck": "Missing diagnosis",
+                "contrarian_check": "Another blind patch wastes budget.",
+                "unblock_actions": ["Run zero-eval attribution"],
+                "unblock_criteria": "Attribution clarifies OOD vs capacity.",
+            }
+        )
+        advisor = FakeAdvisor([hold_json, hold_json, hold_json])
+        await handle_project(self.store, init_evt, advisor, self.inv, "", None, 60, None, None)
+
+        # Trigger first HOLD -> stale triggers archived, review_reasons cleaned to held_pending_unblock
+        res = await handle_project(
+            self.store,
+            Report(
+                id="holdtest", phase="p1", action="report", trial_id="t1", route="r1",
+                cycle=0, mechanism="m1", score=2, evidence="Stuck at 2.",
+            ),
+            advisor, self.inv, "", None, 60, None, None,
+        )
+        self.assertEqual(res["project"]["phase_status"], "held")
+        self.assertEqual(res["project"]["review_reasons"], ["held_pending_unblock"])
+        self.assertIn("stagnation", res["project"]["last_decision"]["triggered_by"])
+
+        # Regular report while HELD must be REJECTED (no shadow dispatch!)
+        with self.assertRaises(ValueError):
+            await handle_project(
+                self.store,
+                Report(
+                    id="holdtest", phase="p1", action="report", trial_id="shadow-t2", route="r1",
+                    cycle=0, mechanism="m2", evidence_kind="diagnostic", evidence="Shadow trial while held",
+                ),
+                advisor, self.inv, "", None, 60, None, None,
+            )
+
+        # unblock_check=True IS allowed and does NOT pollute main trials/proxy counts!
+        chk = await handle_project(
+            self.store,
+            Report(
+                id="holdtest", phase="p1", action="report", trial_id="chk-1", route="r1",
+                cycle=0, mechanism="offline-audit", evidence_kind="diagnostic", unblock_check=True,
+                evidence="Offline attribution complete.", auto_review=False,
+            ),
+            advisor, self.inv, "", None, 60, None, None,
+        )
+        self.assertEqual(chk["project"]["total_trials"], 1)
+        self.assertEqual(chk["project"]["efficiency"]["unblock_checks_count"], 1)
+
+        # 2 more HOLDs -> consecutive_holds == 3 -> hold_churn alert + HOLD-CHURN prompt!
+        await handle_project(self.store, Review(id="holdtest", phase="p1", action="review"), advisor, self.inv, "", None, 60, None, None)
+        r3 = await handle_project(self.store, Review(id="holdtest", phase="p1", action="review"), advisor, self.inv, "", None, 60, None, None)
+        self.assertEqual(r3["project"]["consecutive_holds"], 3)
+        self.assertIn("hold_churn", r3["project"]["efficiency"]["macro_alerts"])
+        self.assertIn("HOLD-CHURN ALERT", advisor.calls[2]["prompt"])
+
+        # Suspend cleanly archives phase and blocks reports/reviews
+        sus = await handle_project(
+            self.store,
+            Suspend(id="holdtest", phase="p1", action="suspend", reason="Superseded by clean v2", superseded_by="p2"),
+            advisor, self.inv, "", None, 60, None, None,
+        )
+        self.assertEqual(sus["project"]["phase_status"], "suspended")
+        self.assertFalse(sus["project"]["dispatch_allowed"])
+        self.assertEqual(sus["project"]["review_reasons"], [])
+        with self.assertRaises(ValueError):
+            await handle_project(self.store, Review(id="holdtest", phase="p1", action="review"), advisor, self.inv, "", None, 60, None, None)
+
+    async def test_soft_regression_and_macro_guard_preserve_multi_trial_runway(self):
+        init_evt = Initialize(
+            id="runway",
+            phase="p1",
+            action="init",
+            objective="Pass 7/8",
+            frozen_gate="Dynamic >= 7/8",
+            score_name="dyn",
+            baseline_score=2,
+            pass_score=7,
+            stagnation_limit=2,
+            proxy_limit=4,
+            route="r0",
+        )
+        pivot_3 = json.dumps(
+            {
+                "decision": "PIVOT",
+                "why": "Switch to fresh family with 3-trial runway.",
+                "main_bottleneck": "Closed-loop drift",
+                "contrarian_check": "Verify gate by trial 3.",
+                "hypothesis_family": "closed-loop-v2",
+                "route": "r1-runway",
+                "next_trial": "Run diag + 2 candidates",
+                "expected_signal": "Score >= 4/8",
+                "stop_condition": "Still <= 2/8 after 3 trials",
+                "max_trials": 3,
+            }
+        )
+        advisor = FakeAdvisor([pivot_3])
+        await handle_project(self.store, init_evt, advisor, self.inv, "", None, 60, None, None)
+        rev = await handle_project(self.store, Review(id="runway", phase="p1", action="review"), advisor, self.inv, "", None, 60, None, None)
+        await handle_project(
+            self.store,
+            Activate(id="runway", phase="p1", action="activate", decision_id=rev["project"]["last_decision"]["id"]),
+            advisor, self.inv, "", None, 60, None, None,
+        )
+
+        # Trial 1: soft regression mid-runway -> does NOT halt!
+        t1 = await handle_project(
+            self.store,
+            Report(
+                id="runway", phase="p1", action="report", trial_id="t1", route="r1-runway",
+                cycle=1, mechanism="m1", evidence_kind="diagnostic",
+                regressions=["Old case minor speed blemish"], regression_severity="soft",
+                evidence="Diagnostic blemish during exploration.",
+            ),
+            advisor, self.inv, "", None, 60, None, None,
+        )
+        self.assertTrue(t1["project"]["dispatch_allowed"])
+        self.assertEqual(t1["review_status"], "not_called")
+
+        # Trial 2: second diagnostic still does NOT prematurely kill 3-trial runway!
+        t2 = await handle_project(
+            self.store,
+            Report(
+                id="runway", phase="p1", action="report", trial_id="t2", route="r1-runway",
+                cycle=1, mechanism="m2", evidence_kind="diagnostic",
+                evidence="Teacher takeover verified.",
+            ),
+            advisor, self.inv, "", None, 60, None, None,
+        )
+        self.assertTrue(t2["project"]["dispatch_allowed"])
+        self.assertEqual(t2["project"]["efficiency"]["soft_regressions"], 1)
+
+    async def test_qualitative_diagnostic_cannot_fake_gate_gain_and_pinned_memory_survives(self):
+        init_evt = Initialize(
+            id="qual",
+            phase="p1",
+            action="init",
+            objective="Single actor achieves >= 6/8 on independent suite",
+            frozen_gate="At least 6/8 end-to-end pass with protection",
+            initial_facts=["Core physical law: offline MSE decouples from closed-loop stability."],
+            route="r1",
+        )
+        res = await handle_project(self.store, init_evt, FakeAdvisor([]), self.inv, "", None, 60, None, None)
+        self.assertIn("init_warning", res)
+        self.assertIn("qualitative_numeric_mismatch", res["project"]["efficiency"]["macro_alerts"])
+
+        # Diagnostic with outcome='progress' MUST NOT reset trials_since_last_improvement!
+        r1 = await handle_project(
+            self.store,
+            Report(
+                id="qual", phase="p1", action="report", trial_id="d1", route="r1",
+                cycle=0, mechanism="teacher-check", evidence_kind="diagnostic",
+                outcome="progress", evidence="Teacher recovered 8/39 seeds.", auto_review=False,
+            ),
+            FakeAdvisor([]), self.inv, "", None, 60, None, None,
+        )
+        self.assertEqual(r1["project"]["efficiency"]["gate_trials"], 0)
+        self.assertEqual(r1["project"]["efficiency"]["trials_since_last_improvement"], 1)
+        self.assertEqual(r1["project"]["efficiency"]["trials_since_last_gate"], 1)
+
+        # Pin a causal fact, then flood 14 rolling facts + 6 governance notes -> pinned fact NEVER evicted!
+        await handle_project(
+            self.store,
+            UpdateMemory(
+                id="qual", phase="p1", action="memory",
+                pin_facts=["Pinned law: single-layer freeze breaks dynamic recovery."],
+                add_facts=[f"Rolling fact #{i}" for i in range(1, 9)],
+                governance_notes=[f"Sign-off note #{i}" for i in range(1, 5)],
+            ),
+            FakeAdvisor([]), self.inv, "", None, 60, None, None,
+        )
+        await handle_project(
+            self.store,
+            UpdateMemory(
+                id="qual", phase="p1", action="memory",
+                add_facts=[f"Rolling fact #{i}" for i in range(9, 16)],
+                governance_notes=[f"Sign-off note #{i}" for i in range(5, 8)],
+            ),
+            FakeAdvisor([]), self.inv, "", None, 60, None, None,
+        )
+        st = await handle_project(
+            self.store, Status(id="qual", phase="p1", action="status", include_history=True),
+            FakeAdvisor([]), self.inv, "", None, 60, None, None,
+        )
+        mem = st["history"]["memory"]
+        facts_text = [item["fact"] for item in mem["verified_facts"]]
+        self.assertIn("Core physical law: offline MSE decouples from closed-loop stability.", facts_text)
+        self.assertIn("Pinned law: single-layer freeze breaks dynamic recovery.", facts_text)
+        self.assertLessEqual(len(mem["verified_facts"]), MAX_VERIFIED_FACTS)
+        self.assertLessEqual(len(mem["governance_notes"]), MAX_GOVERNANCE_NOTES)
+
+    async def test_mcp_feedback_action_schema_forwarding_and_audit_slicing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_cli = Path(tmp) / "fake_agy_schema.py"
+            fake_cli.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json, sys
+                    has_schema = "--json-schema" in sys.argv
+                    has_no_slash = "--disable-slash-commands" in sys.argv
+                    print(json.dumps({"event": "init", "conversation_id": "conv-s", "init": {"model": "gemini-4-neon-xhigh"}}), flush=True)
+                    for line in sys.stdin:
+                        payload = {
+                            "decision": "HOLD",
+                            "why": f"schema={has_schema} no_slash={has_no_slash}",
+                            "main_bottleneck": "Need check",
+                            "contrarian_check": "Could be proxy drift.",
+                            "unblock_actions": ["Verify gate"],
+                            "unblock_criteria": "Real gate result",
+                        }
+                        print(json.dumps({
+                            "event": "result",
+                            "result": {
+                                "status": "SUCCESS",
+                                "conversation_id": "conv-s",
+                                "response": json.dumps(payload),
+                                "structured_output": payload,
+                                "duration_seconds": 0.2,
+                                "usage": {"total_tokens": 88, "cache_read_tokens": 12},
+                            }
+                        }), flush=True)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_cli.chmod(fake_cli.stat().st_mode | stat.S_IXUSR)
+
+            advisor = Advisor(str(fake_cli), tmp)
+            try:
+                await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    project=Initialize(
+                        id="sproj", phase="p1", action="init", objective="G", frozen_gate="F", route="r1"
+                    ),
+                )
+                rev = await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    project=Review(id="sproj", phase="p1", action="review"),
+                )
+                self.assertEqual(rev["review_status"], "decided")
+                self.assertEqual(rev["model_reported"], "gemini-4-neon-xhigh")
+                self.assertIn("schema=True no_slash=True", rev["project"]["last_decision"]["why"])
+
+                # Record feedback in-band via MCP action="feedback"!
+                fb_res = await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    project=ProjectFeedback(
+                        action="feedback",
+                        invocation_id=rev["invocation"]["id"],
+                        label="good_dissent",
+                        note="Caught proxy drift early",
+                        id="sproj",
+                        phase="p1",
+                    ),
+                )
+                self.assertEqual(fb_res["feedback_recorded"]["label"], "good_dissent")
+
+                # Verify audit_report --after-line slicing and consistent model counts
+                sliced = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path, after_line=2)
+                self.assertEqual(sliced["total_invocations"], 2)
+                self.assertEqual(sliced["llm_invocations"], 1)
+                self.assertEqual(sliced["models"], {"gemini-4-neon-xhigh": 1})
+                self.assertEqual(sliced["cache_hit_rate"], 1.0)
+                self.assertGreater(sliced["avg_prompt_chars"], 100)
+                self.assertEqual(sliced["feedback"]["label_counts"], {"good_dissent": 1})
+                rc = audit_report.main(["summary", "--db", str(self.db_path), "--after-line", "2"])
+                self.assertEqual(rc, 0)
+            finally:
+                await advisor.stop()
 
 
 if __name__ == "__main__":

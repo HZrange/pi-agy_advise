@@ -1,12 +1,13 @@
-"""Expose the Antigravity CLI streaming protocol as a local Codex tool."""
+"""Expose the Antigravity CLI streaming protocol as a local Codex strategic commander tool."""
 
 import asyncio
 import json
 import os
 import sys
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import anyio
@@ -14,7 +15,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from project import ProjectEvent, ProjectStore, default_db, handle_project
-from telemetry import record_invocation
+from telemetry import record_feedback, record_invocation
 
 
 IDLE_SECONDS = 600
@@ -37,6 +38,24 @@ SESSION_SETTINGS = {
 }
 
 
+def _read_cli_default_model() -> str | None:
+    """Best-effort read of the local agy CLI default model setting for audit visibility."""
+    candidates = (
+        Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
+        Path.home() / ".gemini" / "antigravity" / "settings.json",
+    )
+    for path in candidates:
+        try:
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                model = data.get("model")
+                if isinstance(model, str) and model.strip():
+                    return model.strip()
+        except (OSError, ValueError, TypeError):
+            continue
+    return None
+
+
 def build_advice_prompt(
     question: str,
     context: str | None,
@@ -44,13 +63,13 @@ def build_advice_prompt(
     *,
     is_followup: bool,
 ) -> str:
-    """Build a domain-agnostic, global-first advisor prompt."""
+    """Build a domain-agnostic, global-first, anti-local-optimum advisor prompt."""
     sections = []
     if is_followup:
         sections.append(
             "Continue this independent review from the new evidence supplied below. "
-            "Revise earlier conclusions if the new facts contradict them, and keep separating "
-            "confirmed facts, inferences, and missing facts."
+            "Revise earlier conclusions if the new facts contradict them, challenge any emerging "
+            "local-optimum tunnel vision, and keep separating confirmed facts, inferences, and missing facts."
         )
     else:
         sections.append(
@@ -65,32 +84,34 @@ def build_advice_prompt(
     if stance == "red_team":
         sections.append(
             "Stance (Red-Team Audit): Construct the strongest evidence-based case for why the proposed "
-            "approach, architecture, or hypothesis will fail to achieve the real end goal. Identify hidden "
-            "assumptions, proxy-vs-real-goal traps, single points of failure, and efficiency traps "
-            "(spending more time/compute on indirect proxies or micro-patches than a direct end-to-end "
-            "test or structural fix would cost). Name the cheapest falsifying check and state clearly "
-            "whether this branch should stop or pivot."
+            "approach, architecture, or hypothesis will fail to achieve the real end goal — even if the "
+            "caller or project owner already favors it. Identify hidden assumptions, local-optimum traps, "
+            "proxy-vs-real-goal drift, single points of failure, and efficiency traps (spending more time/compute "
+            "on indirect proxies or micro-patches than a direct end-to-end test or structural fix would cost). "
+            "Name the cheapest falsifying check, offer a structurally different alternative if warranted, and "
+            "state clearly whether this branch should stop or pivot."
         )
     elif stance == "tactical":
         sections.append(
             "Stance (Focused Tactical): First check in 1-2 sentences whether this tactical question "
-            "reflects over-constrained micromanagement or optimizing a dead-end proxy; if so, warn "
-            "clearly. Then answer directly from first principles for the stated scope, distinguish "
-            "confirmed facts from assumptions, and state concrete pass/stop criteria without "
+            "reflects over-constrained micromanagement or optimizing a dead-end proxy; if so, voice clear "
+            "dissent before answering. Then answer directly from first principles for the stated scope, "
+            "distinguish confirmed facts from assumptions, and state concrete pass/stop criteria without "
             "over-prescribing brittle local accounting details."
         )
     elif not is_followup:
         sections.append(
-            "Stance (Global-First Independent Reviewer):\n"
+            "Stance (Global-First Independent Commander):\n"
             "1. Zoom out before zooming in: first check whether the question frames a local symptom, "
-            "unverified proxy, or sunk-cost patch rather than the real main bottleneck against the "
-            "overarching goal.\n"
-            "2. Optimize for global efficiency (real end-to-end progress per unit compute + wall-clock "
+            "local optimum, unverified proxy, or sunk-cost patch rather than the real main bottleneck "
+            "against the overarching goal.\n"
+            "2. Anti-sycophancy & fearless dissent: do NOT rubber-stamp proposed options or defer merely "
+            "because the caller or owner already leans one way. You are explicitly authorized to challenge the premise, "
+            "lead with your **Dissent / Counter-Case** when verified evidence exposes a flaw or better macro path, "
+            "and derive the right direction from first principles.\n"
+            "3. Optimize for global efficiency (real end-to-end progress per unit compute + wall-clock "
             "turnaround): call out over-engineering, low-ROI micro-tuning, unverified proxy gates, or "
             "serial bottlenecks that should be simplified, tested directly, or parallelized.\n"
-            "3. Do not rubber-stamp proposed options: derive the right direction from first principles "
-            "using the goal, hard constraints, and observed failures. You are explicitly authorized to "
-            "challenge the premise or recommend stopping/pivoting the current branch.\n"
             "4. Separate confirmed facts, inferences, and critical unknowns that could overturn your judgment.\n"
             "5. Give a decisive strategic recommendation, the highest-leverage next step (plus any "
             "independent parallel tracks), and a concrete falsification or stop condition. Leave local "
@@ -108,14 +129,27 @@ class Advisor:
         self.session_efforts: dict[str, Effort] = {}
         self.session_models: dict[str, str | None] = {}
         self.active_session: str | None = None
+        self.active_schema: str | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.idle: asyncio.Task[None] | None = None
         self.stderr_task: asyncio.Task | None = None
         self.stderr_tail = b""
+        self.stderr_fatal: asyncio.Event | None = None
+        self.stderr_error: RuntimeError | None = None
 
     async def drain_stderr(self, stream: asyncio.StreamReader) -> None:
         while chunk := await stream.read(4096):
             self.stderr_tail = (self.stderr_tail + chunk)[-4096:]
+            lower = self.stderr_tail.decode(errors="replace").lower()
+            if any(
+                term in lower
+                for term in ("authentication required", "please visit the url to log in", "not logged in")
+            ):
+                self.stderr_error = RuntimeError(
+                    "Antigravity CLI needs an authenticated session. Sign in with agy on this host."
+                )
+                if self.stderr_fatal is not None:
+                    self.stderr_fatal.set()
 
     def cancel_idle(self) -> None:
         if self.idle is not None:
@@ -160,23 +194,37 @@ class Advisor:
             self.stderr_task = None
         self.process = None
         self.active_session = None
+        self.active_schema = None
+        self.stderr_fatal = None
+        self.stderr_error = None
 
-    async def start(self, session_id: str, effort: Effort | None = None, model: str | None = None) -> None:
+    async def start(
+        self,
+        session_id: str,
+        effort: Effort | None = None,
+        model: str | None = None,
+        schema_json: str | None = None,
+    ) -> None:
         await self.stop()
         # The CLI's headless default avoids Plan mode's artifact approval step.
         arguments = [
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--sandbox",
+            "--disable-slash-commands",
             "--settings", json.dumps(SESSION_SETTINGS),
         ]
         if effort is not None:
             arguments.extend(["--effort", effort])
         if model is not None:
             arguments.extend(["--model", model])
+        if schema_json is not None:
+            arguments.extend(["--json-schema", schema_json])
         if conversation := self.conversations.get(session_id):
             arguments.extend(["--conversation", conversation])
         self.stderr_tail = b""
+        self.stderr_fatal = asyncio.Event()
+        self.stderr_error = None
         self.process = await asyncio.create_subprocess_exec(
             self.executable,
             *arguments,
@@ -187,6 +235,7 @@ class Advisor:
             limit=4 * 1024 * 1024,
         )
         self.active_session = session_id
+        self.active_schema = schema_json
         self.stderr_task = asyncio.create_task(self.drain_stderr(self.process.stderr))
 
     def failure(self, message: str, detail: object = "") -> RuntimeError:
@@ -197,24 +246,62 @@ class Advisor:
             return RuntimeError("Antigravity reported a quota or rate limit.")
         return RuntimeError(message)
 
+    async def _readline_or_fatal(self, process: asyncio.subprocess.Process) -> bytes:
+        if self.stderr_error is not None:
+            raise self.stderr_error
+        read_task = asyncio.create_task(process.stdout.readline())
+        fatal_event = self.stderr_fatal
+        if fatal_event is None:
+            return await read_task
+        fatal_task = asyncio.create_task(fatal_event.wait())
+        try:
+            done, pending = await asyncio.wait({read_task, fatal_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            if fatal_task in done and self.stderr_error is not None:
+                raise self.stderr_error
+            return read_task.result()
+        except BaseException:
+            for task in (read_task, fatal_task):
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+            raise
+
     async def exchange(
-        self, prompt: str, session_id: str, effort: Effort | None, model: str | None
+        self,
+        prompt: str,
+        session_id: str,
+        effort: Effort | None,
+        model: str | None,
+        schema_json: str | None = None,
+        single_turn: bool = False,
     ) -> dict[str, object]:
         process = self.process
         if (
             process is None
             or self.active_session != session_id
+            or self.active_schema != schema_json
             or process.returncode is not None
             or process.stdin.is_closing()
         ):
-            await self.start(session_id, effort, model)
+            await self.start(session_id, effort, model, schema_json)
             process = self.process
         else:
             self.stderr_tail = b""
+            if self.stderr_fatal is not None:
+                self.stderr_fatal.clear()
+            self.stderr_error = None
         message = {"event": "user", "message": {"content": prompt}}
         try:
             process.stdin.write(json.dumps(message, ensure_ascii=False).encode() + b"\n")
             await process.stdin.drain()
+            if single_turn:
+                # Signal EOF so single-turn --json-schema stream-json knows this is the final turn.
+                process.stdin.close()
         except (BrokenPipeError, ConnectionResetError) as error:
             process.stdin.close()
             with suppress(BrokenPipeError, ConnectionResetError, asyncio.TimeoutError):
@@ -222,7 +309,9 @@ class Advisor:
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(self.stderr_task), 0.25)
             raise self.failure("Antigravity CLI closed its input before receiving the question.") from error
-        while line := await process.stdout.readline():
+
+        init_model: str | None = None
+        while line := await self._readline_or_fatal(process):
             try:
                 event = json.loads(line)
             except (UnicodeError, ValueError):
@@ -232,6 +321,10 @@ class Advisor:
             if event.get("event") == "init":
                 if isinstance(event.get("conversation_id"), str):
                     self.conversations[session_id] = event["conversation_id"]
+                init_block = event.get("init") if isinstance(event.get("init"), dict) else {}
+                candidate_model = event.get("model") or init_block.get("model")
+                if isinstance(candidate_model, str) and candidate_model.strip():
+                    init_model = candidate_model.strip()
             if event.get("event") != "result":
                 continue
             result = event.get("result")
@@ -242,18 +335,27 @@ class Advisor:
                 self.conversations[session_id] = conversation
             if result.get("status") != "SUCCESS":
                 raise self.failure("Antigravity reported a failed turn.", result.get("error"))
+
+            structured = result.get("structured_output")
             advice = result.get("response")
+            if (not isinstance(advice, str) or not advice.strip()) and isinstance(structured, dict):
+                advice = json.dumps(structured, ensure_ascii=False)
             if not isinstance(advice, str) or not advice.strip():
                 raise self.failure("Antigravity returned no advice. Try a self-contained text question.")
             if session_id not in self.conversations:
                 raise self.failure("Antigravity returned advice without a conversation ID.")
-            return {
+
+            reported_model = result.get("model") or event.get("model") or init_model
+            reply: dict[str, object] = {
                 "advice": advice.strip(),
                 "session_id": session_id,
                 "duration_seconds": result.get("duration_seconds"),
                 "usage": result.get("usage"),
-                "model_reported": result.get("model") if isinstance(result.get("model"), str) else None,
+                "model_reported": reported_model if isinstance(reported_model, str) else None,
             }
+            if isinstance(structured, dict):
+                reply["structured_output"] = structured
+            return reply
         await process.wait()
         await self.stderr_task
         raise self.failure(f"Antigravity CLI exited before replying (exit {process.returncode}).")
@@ -265,6 +367,7 @@ class Advisor:
         timeout: int,
         effort: Effort | None = None,
         model: str | None = None,
+        json_schema: dict[str, Any] | None = None,
     ) -> dict[str, object]:
         clock = asyncio.get_running_loop().time
         started = clock()
@@ -292,27 +395,49 @@ class Advisor:
                 model = saved_model
             else:
                 model = model or os.getenv("AGY_ADVISE_MODEL") or None
+
+            use_schema = (
+                json_schema is not None
+                and os.getenv("AGY_ADVISE_JSON_SCHEMA", "on").strip().lower() not in ("off", "0", "false", "no")
+            )
+            schema_json = json.dumps(json_schema, ensure_ascii=False) if use_schema else None
+            single_turn = schema_json is not None and session_id is None
             self.cancel_idle()
             key = session_id or uuid4().hex
             try:
-                reply = await asyncio.wait_for(self.exchange(prompt, key, effort, model), remaining)
+                reply = await asyncio.wait_for(
+                    self.exchange(prompt, key, effort, model, schema_json, single_turn=single_turn),
+                    remaining,
+                )
             except BaseException as error:
+                timeout_err = (
+                    self.failure(f"Antigravity timed out after {timeout} seconds, including queue wait.")
+                    if isinstance(error, asyncio.TimeoutError)
+                    else None
+                )
                 with anyio.CancelScope(shield=True):
                     await self.stop()
                 if session_id is None:
                     self.conversations.pop(key, None)
-                if isinstance(error, asyncio.TimeoutError):
-                    raise RuntimeError(f"Antigravity timed out after {timeout} seconds, including queue wait.") from error
+                if timeout_err is not None:
+                    raise timeout_err from error
                 raise
-            if effort is not None:
-                self.session_efforts[key] = effort
-            self.session_models[key] = model
-            self.idle = asyncio.create_task(self.expire())
+            if single_turn:
+                await self.stop(graceful=True)
+            else:
+                if effort is not None:
+                    self.session_efforts[key] = effort
+                self.session_models[key] = model
+                self.idle = asyncio.create_task(self.expire())
+
+            configured_model = model or _read_cli_default_model()
             reply.update(
                 queue_seconds=round(queue_seconds, 3),
                 elapsed_seconds=round(clock() - started, 3),
                 requested_effort=effort,
                 model_requested=model,
+                model_configured=configured_model,
+                prompt_chars=len(prompt),
             )
             return reply
         finally:
@@ -364,6 +489,7 @@ async def execute_advise(
     phase = getattr(project, "phase", None) if is_project else None
 
     response: dict[str, object] | None = None
+    prompt_chars: int | None = None
     status = "ok"
     error_text: str | None = None
     try:
@@ -373,14 +499,26 @@ async def execute_advise(
             if stance is not None:
                 raise ValueError("Project reviews use their own structured clean-room review protocol.")
             response = await handle_project(
-                store, project, advisor, invocation, question, context, timeout_seconds, effort, model
+                store,
+                project,
+                advisor,
+                invocation,
+                question,
+                context,
+                timeout_seconds,
+                effort,
+                model,
+                feedback_recorder=record_feedback,
             )
+            if isinstance(response.get("prompt_chars"), int):
+                prompt_chars = response["prompt_chars"]
             status = _classify_response_status(response)
             return response
 
         if not question.strip():
             raise ValueError("Supply a self-contained question.")
         prompt = build_advice_prompt(question, context, resolved_stance or "global", is_followup=session_id is not None)
+        prompt_chars = len(prompt)
         reply = await advisor.ask(prompt, session_id, timeout_seconds, effort, model)
         response = {"invocation": invocation, "requested_stance": resolved_stance, **reply}
         return response
@@ -401,6 +539,7 @@ async def execute_advise(
                     elapsed_seconds=elapsed,
                     question=question,
                     context=context,
+                    prompt_chars=prompt_chars,
                     stance=resolved_stance,
                     is_followup=session_id is not None,
                     session_id=session_id,
@@ -448,15 +587,14 @@ def server(executable: str) -> FastMCP:
         ] = None,
         project: ProjectEvent | None = None,
     ) -> dict[str, object]:
-        """Ask Antigravity for independent global judgment or manage a persistent project phase.
+        """Consult Antigravity as an independent global Chief Commander or manage a persistent project phase.
 
-        Default Q&A uses a global-first stance across any project (architecture, debugging,
-        systems, ML, product) and audits premises before answering local details.
-        Project actions are init, report, status, list, memory, review and activate, backed
-        by bounded three-tier external memory (L1 constitution, L2 distilled facts/postmortems,
-        L3 recent window) and clean-room reviews with actionable HOLD prescriptions.
-        A report that triggers review sends recorded project evidence to Google. Supply only
-        text authorized for sharing.
+        Default Q&A uses a global-first, contrarian stance that surfaces blind spots and local-optimum traps
+        across any project. Project actions are init, report, status, list, memory, review, activate,
+        directive (records human steering/budget updates and runs a contrarian pre-mortem that auto-activates
+        on concur/caution or pauses to voice dissent), suspend (cleanly freezes superseded/stalled phases),
+        and feedback (records post-hoc quality labels in-band). Uses native JSON schema enforcement,
+        graded L2 pinned causal memory, and closed-loop cycle outcome attribution.
         """
         advisor = ctx.request_context.lifespan_context
         return await execute_advise(

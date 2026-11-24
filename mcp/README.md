@@ -1,29 +1,28 @@
 # agy-advise-mcp
 
-`agy-advise-mcp` 是 [`pi-agy_advise`](../README.md) 的**可选 Python MCP 配套**。它与 Pi 的 TypeScript 扩展共享同一个本机原生 `agy` CLI，但面向 Codex 和其他 MCP 客户端，提供跨多轮项目的决策治理能力。
+`agy-advise-mcp` 是 [`pi-agy_advise`](../README.md) 的**可选 Python MCP 配套**。它与 Pi 的 TypeScript 扩展共享同一个本机原生 `agy` CLI，面向 Codex 和其他 MCP 客户端，定位为**敢提反对意见、跳出局部最优解的远程 AI 总指挥**。
 
 它不是 Pi TypeScript 扩展的替代品，也不会随 Pi 扩展自动加载。只使用轻量问答时，无需安装这里的 Python 依赖。
 
 ## 两种配套实现的分工
 
 - **Pi TypeScript 扩展**：轻量问答、审查立场、会话控制、模型与推理档位覆盖。
-- **`agy-advise-mcp`**：全局问答之外，增加持久化项目账本、数值或定性门槛、派发门禁、HOLD 解封处方、三层外置记忆和调用审计。
+- **`agy-advise-mcp`**：全局问答之外，提供持久化项目决策核心、人类指令反方预验尸（`directive`）、阶段冻结（`suspend`）、分级置顶 L2 因果记忆、原生 `--json-schema` 结构化裁决、闭环结果归因（`track_record`）与可切片调用审计。
 
 两种实现使用同一个 `agy_advise` 工具名，但不共享会话、SQLite 项目状态或审计日志。
 
-## 功能
+## 核心能力
 
-- 默认全局审查，也可使用 `red_team` 或 `tactical` 立场，强调端到端效率（单位算力与墙钟时间进展）与并行化拆分。
-- 数值指标越高越好、越低越好，以及无分数的定性里程碑。
-- 单周期与**跨周期**防空转护栏：停滞、单机制空转、单周期/跨周期代理漂移（`global_proxy_drift`）、跨周期宏观停滞（`macro_stagnation`）、频繁换皮转向（`pivot_churn`）、微操循环告警（`micro_management_loop`）、保护项回归、阻塞、预算耗尽和周期复核。
-- `CONTINUE` / `PIVOT` 战略授权与连续跑道（`hypothesis_family`、`efficiency_rationale`、`parallel_tracks`、`max_trials`），`HOLD` 强制解封动作与最小证据，激活前保持禁止派发。
-- L1 宪法 + 效率记分卡、L2 蒸馏战略事实与路线尸检、L3 紧凑近期窗口；每次复盘使用干净会话，触发宏观告警时自动切入宏观重置模式。
-- `invocations.jsonl` 调用审计（区分 `llm_attempted`/`llm_called`/`llm_responded`）、`feedback.jsonl` 事后质量打标，以及结合 `projects.sqlite3` 的项目效率与反空转汇总报表。
+- **全局指挥与反顺从异议**：默认 `global` / `red_team` 视角主动挑战前提与局部最优解；即使是人类拍板的 `directive` 也会默认做一次快速反方预验尸（`concur` / `caution` 自动生效免盖章往返，`dissent` 亮红牌呈报异议并允许人类显式覆盖）。
+- **动态预算与宪法解耦**：不可妥协红线（`non_negotiables`）与可重批阶段预算（`budget_envelope`）分离，杜绝 L1 状态与最新预算自相矛盾。
+- **反空转与反 HOLD-churn**：拦截 `HOLD` 内影子试次（核验走独立 `unblock_check`）、提供 `suspend` 归档终态、分级 `regression_severity="hard"|"soft"`、修复跨周期护栏误杀 `max_trials=3..5` 跑道，以及封堵定性模式伪装数值门禁。
+- **不失忆的分级 L2 记忆与瘦身 Prompt**：`pin_facts` 置顶核心因果规律永不被 FIFO 挤出，`governance_notes` 独立存放行政纪要；配合原生 `agy --json-schema` 与 `--disable-slash-commands`，显著压缩输入/输出噪声。
+- **闭环结果归因 + MCP 内置反馈**：自动追踪每轮周期的真分兑现率、跑道利用率与 `dissent_vindicated / dissent_refuted`，支持 `action: "feedback"` 直接在 MCP 内打标，以及 `audit_report.py --since / --after-line` 切片审计。
 
 ## 前置条件
 
 - Python 3.10 或更高版本。
-- 已安装并登录原生 [Antigravity CLI](https://antigravity.google/docs/cli/install/)。当前实现使用 Python 3.10 与 agy 1.5.15 验证。
+- 已安装并登录原生 [Antigravity CLI](https://antigravity.google/docs/cli/install/)（当前在 Python 3.10 与 agy 1.5.16 验证）。
 
 先确认原生无交互调用可用：
 
@@ -49,8 +48,6 @@ args = ["/absolute/path/to/pi-agy_advise/mcp/scripts/server.py", "/home/USER/.lo
 tool_timeout_sec = 270
 ```
 
-其他 MCP 客户端可使用相同的 stdio 命令和参数。修改配置后重启对应客户端或 MCP 会话。
-
 如需安装调用规范 Skill，可将本目录链接到 Codex 的 Skill 目录；不要覆盖已有安装：
 
 ```bash
@@ -71,31 +68,20 @@ ln -s /absolute/path/to/pi-agy_advise/mcp ~/.codex/skills/agy-advise
 
 默认状态目录为 `~/.local/share/codex-agy-advise/`：
 
-- `projects.sqlite3`：项目目标、证据、路线、裁决和三层记忆。
-- `invocations.jsonl`：以 `0600` 权限写入的调用元数据与截断预览。
-- `feedback.jsonl`：可选的人工质量反馈。
+- `projects.sqlite3`：项目目标、预算包络、试次、核验记录、分级记忆、裁决与闭环归因。
+- `invocations.jsonl`：以 `0600` 权限写入的调用元数据（含 `model_configured`、`prompt_chars`、`directive_alignment`）与截断预览。
+- `feedback.jsonl`：人工或 MCP 内置记录的质量反馈。
 
-环境变量：
+环境变量：`AGY_ADVISE_DB`、`AGY_ADVISE_LOG`、`AGY_ADVISE_LOG_FULL=1`、`AGY_ADVISE_MODEL`。
 
-- `AGY_ADVISE_DB`：覆盖 SQLite 路径，测试时用于隔离状态。
-- `AGY_ADVISE_LOG`：设为 `off` 关闭审计日志，或指定自定义 JSONL 路径。
-- `AGY_ADVISE_LOG_FULL=1`：记录完整问答，仅供明确授权的调试使用。
-- `AGY_ADVISE_MODEL`：设置默认模型；单次调用仍可覆盖。
-
-只有显式提交的 `question`、`context` 和项目复盘证据会发送给 Google。顾问 CLI 在临时目录中运行，文件、命令、浏览器和 MCP 工具均被禁用。不要发送密钥、凭据、授权码或未授权的敏感内容。
+仅显式提交的 `question`、`context` 和项目复盘包会发送给 Google。顾问 CLI 保持现有安全权限：在临时目录中运行，文件、命令、浏览器和 MCP 工具均被禁用。不要发送密钥、凭据或未授权敏感内容。
 
 ## 审计与反馈
 
 ```bash
 python3 scripts/audit_report.py --days 14
-python3 scripts/audit_report.py --recent 10
-python3 scripts/audit_report.py feedback <invocation_id> helpful --note "简短复盘原因"
+python3 scripts/audit_report.py summary --after-line 227 --project xduckcraft
+python3 scripts/audit_report.py feedback <invocation_id> good_dissent --note "提前拦住局部最优陷阱"
 ```
 
-完整参数、项目动作与故障处置见 [`SKILL.md`](SKILL.md)。
-
-## 合规与许可证
-
-本组件只调用本机单账号的官方 headless CLI，不代理、不转发、不多账号轮换，也不绕过任何限额。使用者仍需确认所在账号类型的服务条款。
-
-代码与基础传输、复核规范演化自 [`pi-agy_advise@dbc9ad2`](https://github.com/fishing-dev-sm/pi-agy_advise/commit/dbc9ad2954797cd0a95ccfac4de6440839641de8)，并作为可选配套在同一仓库发布。许可证见根目录的 [MIT License](../LICENSE)。
+完整参数、项目动作与故障处置见 [`SKILL.md`](SKILL.md)。许可证见根目录的 [MIT License](../LICENSE)。

@@ -1,4 +1,4 @@
-"""Lightweight local invocation logging and feedback aggregation for agy_advise."""
+"""Lightweight local invocation logging, outcome tracking, and audit reporting for agy_advise."""
 
 import json
 import math
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from project import build_efficiency_scorecard, normalize_state
+from project import build_advisor_track_record, build_efficiency_scorecard, normalize_state
 
 try:
     import fcntl
@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 FEEDBACK_LABELS = (
     "helpful",
+    "good_dissent",
     "rubber_stamp",
     "missed_root_cause",
     "false_alarm",
@@ -116,6 +117,7 @@ def build_invocation_record(
     elapsed_seconds: float,
     question: str = "",
     context: str | None = None,
+    prompt_chars: int | None = None,
     stance: str | None = None,
     is_followup: bool = False,
     session_id: str | None = None,
@@ -137,6 +139,7 @@ def build_invocation_record(
     effective_model_req = resp.get("model_requested") if resp.get("model_requested") is not None else model_requested
     effective_effort = resp.get("requested_effort") if resp.get("requested_effort") is not None else effort
     effective_session = resp.get("session_id") if isinstance(resp.get("session_id"), str) else session_id
+    effective_prompt_chars = prompt_chars if prompt_chars is not None else resp.get("prompt_chars")
 
     error_text = error or (resp.get("error") if isinstance(resp.get("error"), str) else None)
     error_lower = (error_text or "").lower()
@@ -157,12 +160,24 @@ def build_invocation_record(
     decision_value = None
     decision_max_trials = None
     hypothesis_family = None
+    directive_alignment = resp.get("directive_alignment") if isinstance(resp.get("directive_alignment"), str) else None
+    dissent_raised = bool(resp.get("dissent_raised"))
     if review_status == "decided" and isinstance(last_decision.get("decision"), str):
         decision_value = last_decision["decision"]
         if isinstance(last_decision.get("max_trials"), int):
             decision_max_trials = last_decision["max_trials"]
         if isinstance(last_decision.get("hypothesis_family"), str):
             hypothesis_family = last_decision["hypothesis_family"]
+        if directive_alignment is None and isinstance(last_decision.get("alignment"), str):
+            directive_alignment = last_decision["alignment"]
+        if directive_alignment == "dissent":
+            dissent_raised = True
+
+    effective_reasons = (
+        last_decision["triggered_by"]
+        if review_status == "decided" and isinstance(last_decision.get("triggered_by"), list)
+        else (proj.get("review_reasons") if isinstance(proj.get("review_reasons"), list) else [])
+    )
 
     record: dict[str, Any] = {
         "ts": utc_now(),
@@ -178,6 +193,7 @@ def build_invocation_record(
         "duration_seconds": resp.get("duration_seconds"),
         "model_requested": effective_model_req,
         "model_reported": resp.get("model_reported"),
+        "model_configured": resp.get("model_configured"),
         "requested_effort": effective_effort,
         "usage": usage,
         "stance": resp.get("requested_stance", stance) if mode == "qa" else None,
@@ -190,13 +206,16 @@ def build_invocation_record(
         "route": proj.get("route"),
         "cycle": proj.get("cycle"),
         "review_status": review_status,
-        "review_reasons": proj.get("review_reasons") if isinstance(proj.get("review_reasons"), list) else [],
+        "review_reasons": effective_reasons,
         "decision": decision_value,
+        "directive_alignment": directive_alignment,
+        "dissent_raised": dissent_raised,
         "decision_max_trials": decision_max_trials,
         "hypothesis_family": hypothesis_family,
         "dispatch_allowed": proj.get("dispatch_allowed"),
         "question_chars": len(question or ""),
         "context_chars": len(context or ""),
+        "prompt_chars": effective_prompt_chars if isinstance(effective_prompt_chars, int) else None,
         "advice_chars": len(advice) if advice is not None else 0,
         "question_preview": preview_text(question, 240),
         "advice_preview": preview_text(advice, 320),
@@ -309,6 +328,7 @@ def _read_project_efficiency(db_path: Path | None, project_id: str | None = None
         except (TypeError, ValueError):
             continue
         scorecard = build_efficiency_scorecard(state)
+        track_record = build_advisor_track_record(state)
         items.append(
             {
                 "id": state.get("id"),
@@ -318,6 +338,7 @@ def _read_project_efficiency(db_path: Path | None, project_id: str | None = None
                 "baseline_score": state.get("baseline_score"),
                 "best_score": state.get("best_score"),
                 "pass_score": state.get("pass_score"),
+                "track_record": track_record,
                 **scorecard,
             }
         )
@@ -331,15 +352,22 @@ def summarize_logs(
     db_path: Path | None = None,
     project_id: str | None = None,
     days: int | None = None,
+    since: str | None = None,
+    after_line: int | None = None,
     recent: int = 8,
 ) -> dict[str, Any]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days is not None else None
+    since_dt = _parse_ts(since) if since else None
+    if since_dt is not None and (cutoff is None or since_dt > cutoff):
+        cutoff = since_dt
+
     invocations = read_jsonl(log_path)
     feedback_rows = read_jsonl(feedback_path)
 
     filtered: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
-    for row in invocations:
+    start_idx = max((after_line or 1) - 1, 0)
+    for row in invocations[start_idx:]:
         if project_id is not None and row.get("project_id") != project_id:
             continue
         if cutoff is not None:
@@ -368,11 +396,6 @@ def summarize_logs(
     action_counts = Counter(f"{row.get('mode', '?')}:{row.get('action', '?')}" for row in filtered)
     status_counts = Counter(row.get("status", "unknown") for row in filtered)
     stance_counts = Counter(row["stance"] for row in filtered if row.get("mode") == "qa" and row.get("stance"))
-    model_counts = Counter(
-        row.get("model_reported") or row.get("model_requested") or "default"
-        for row in filtered
-        if row.get("llm_called")
-    )
     project_counts = Counter(row["project_id"] for row in filtered if row.get("project_id"))
     review_status_counts = Counter(
         row["review_status"] for row in filtered if row.get("mode") == "project" and row.get("review_status")
@@ -389,6 +412,13 @@ def summarize_logs(
         elif row.get("action") == "review" and "explicit_review" in reasons:
             trigger_counts["explicit_review"] += 1
     decision_counts = Counter(row["decision"] for row in filtered if row.get("decision"))
+    directive_alignments = Counter(
+        row["directive_alignment"]
+        for row in filtered
+        if row.get("mode") == "project"
+        and row.get("action") == "directive"
+        and row.get("directive_alignment")
+    )
 
     def _row_responded(row: dict[str, Any]) -> bool:
         if "llm_responded" in row:
@@ -413,13 +443,32 @@ def summarize_logs(
         for row in filtered
         if row.get("llm_called") and (_row_responded(row) or not _row_pre_model_error(row))
     ]
+    # Consistent model counts over the exact same llm_rows population.
+    model_counts = Counter(
+        row.get("model_reported")
+        or row.get("model_requested")
+        or (f"default:{row['model_configured']}" if row.get("model_configured") else "default")
+        for row in llm_rows
+    )
     llm_elapsed = [float(row["elapsed_seconds"]) for row in llm_rows if isinstance(row.get("elapsed_seconds"), (int, float))]
     llm_queue = [float(row["queue_seconds"]) for row in llm_rows if isinstance(row.get("queue_seconds"), (int, float))]
+    prompt_char_values = [
+        int(row["prompt_chars"]) for row in llm_rows if isinstance(row.get("prompt_chars"), int) and row["prompt_chars"] > 0
+    ]
     total_tokens = 0
+    cache_hits = 0
     for row in llm_rows:
         usage = row.get("usage")
-        if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), (int, float)):
-            total_tokens += int(usage["total_tokens"])
+        if isinstance(usage, dict):
+            if isinstance(usage.get("total_tokens"), (int, float)):
+                total_tokens += int(usage["total_tokens"])
+            if isinstance(usage.get("cache_read_tokens"), (int, float)) and usage["cache_read_tokens"] > 0:
+                cache_hits += 1
+
+    avg_elapsed = round(sum(llm_elapsed) / len(llm_elapsed), 2) if llm_elapsed else None
+    avg_tokens = round(total_tokens / len(llm_responded_rows)) if llm_responded_rows else None
+    avg_prompt_chars = round(sum(prompt_char_values) / len(prompt_char_values)) if prompt_char_values else None
+    cache_hit_rate = round(cache_hits / len(llm_responded_rows), 3) if llm_responded_rows else None
 
     qa_rows = [row for row in filtered if row.get("mode") == "qa"]
     substantive_qa_rows = [row for row in qa_rows if (row.get("question_chars") or 0) > 20]
@@ -433,6 +482,11 @@ def summarize_logs(
     report_count = action_counts["project:report"]
     decided_review_count = review_status_counts["decided"]
     review_to_report_ratio = round(decided_review_count / report_count, 3) if report_count else None
+
+    directive_total = sum(directive_alignments.values())
+    directive_dissent_rate = (
+        round(directive_alignments["dissent"] / directive_total, 3) if directive_total else None
+    )
 
     effective_db = db_path
     if effective_db is None and log_path is not None:
@@ -462,7 +516,7 @@ def summarize_logs(
     if review_attempts and review_status_counts["invalid_decision"] / review_attempts >= 0.1:
         hints.append(
             f"Elevated invalid_decision rate ({review_status_counts['invalid_decision']}/{review_attempts}): "
-            "inspect advice_preview and tighten review_prompt / decode_decision."
+            "inspect advice_preview and verify --json-schema enforcement."
         )
     if review_attempts and review_status_counts["stale"] / review_attempts >= 0.15:
         hints.append(
@@ -477,17 +531,27 @@ def summarize_logs(
     if report_count >= 5 and (review_to_report_ratio or 0.0) >= 0.8:
         hints.append(
             f"Near 1:1 review-to-report ratio ({decided_review_count}/{report_count} = {review_to_report_ratio:.2f}): "
-            "stop micromanaging with max_trials=1; grant 2-5 trial runways for substantive routes."
+            "stop micromanaging with max_trials=1 or hard-stopping soft regressions; use directive / soft severity / 2-5 trial runways."
+        )
+    if (avg_prompt_chars or 0) > 18000 or (avg_elapsed or 0.0) > 75.0:
+        hints.append(
+            f"Heavy review latency/prompt overhead (avg_elapsed={avg_elapsed}s, avg_prompt_chars={avg_prompt_chars}): "
+            "keep L2 pinned facts crisp and avoid dumping long procedural SOPs into questions."
+        )
+    if directive_total >= 5 and directive_alignments["caution"] == 0 and directive_alignments["dissent"] == 0:
+        hints.append(
+            f"Potential rubber-stamp risk: {directive_total}/{directive_total} directive checks returned 'concur' with zero caution/dissent."
         )
     for item in project_efficiency:
         alerts = item.get("macro_alerts") or []
         if alerts:
             hints.append(
-                f"Project {item['id']}/{item['phase']} spinning alerts [{', '.join(alerts)}]: "
+                f"Project {item['id']}/{item['phase']} alerts [{', '.join(alerts)}]: "
                 f"gate_trials={item['gate_trials']}/{item['total_trials']}, "
-                f"since_improvement={item['trials_since_last_improvement']} trials / "
-                f"{item['pivots_since_last_improvement']} pivots, "
-                f"since_last_gate={item['trials_since_last_gate']}, "
+                f"since_improvement={item['trials_since_last_improvement']}t/"
+                f"{item['pivots_since_last_improvement']}p, "
+                f"since_last_gate={item['trials_since_last_gate']}t, "
+                f"consecutive_holds={item.get('consecutive_holds', 0)}, "
                 f"max_trials=1={item['one_trial_plans']}/{item['planned_cycles']}."
             )
     if feedback_counts["rubber_stamp"] > 0:
@@ -498,7 +562,7 @@ def summarize_logs(
     if feedback_counts["false_alarm"] > 0:
         hints.append(
             f"{feedback_counts['false_alarm']} false_alarm feedback item(s): "
-            "review stagnation_limit / same_mechanism_limit / proxy_limit thresholds."
+            "review stagnation_limit / same_mechanism_limit / proxy_limit / regression_severity."
         )
 
     recent_entries = [
@@ -513,7 +577,9 @@ def summarize_logs(
             "stance": row.get("stance"),
             "review_status": row.get("review_status"),
             "decision": row.get("decision"),
+            "directive_alignment": row.get("directive_alignment"),
             "elapsed_seconds": row.get("elapsed_seconds"),
+            "prompt_chars": row.get("prompt_chars"),
             "question_preview": row.get("question_preview"),
             "error": row.get("error"),
         }
@@ -524,7 +590,7 @@ def summarize_logs(
         "log_path": str(log_path) if log_path else None,
         "feedback_path": str(feedback_path) if feedback_path else None,
         "db_path": str(effective_db) if effective_db else None,
-        "filters": {"project_id": project_id, "days": days},
+        "filters": {"project_id": project_id, "days": days, "since": since, "after_line": after_line},
         "total_invocations": len(filtered),
         "llm_invocations": len(llm_rows),
         "llm_attempted_invocations": len(llm_attempted_rows),
@@ -535,21 +601,31 @@ def summarize_logs(
         "timeout_or_transport_errors": timeout_count,
         "timeout_rate": round(timeout_count / len(llm_rows), 3) if llm_rows else 0.0,
         "latency_seconds": {
+            "avg": avg_elapsed,
             "p50": percentile(llm_elapsed, 50),
             "p95": percentile(llm_elapsed, 95),
             "max": round(max(llm_elapsed), 3) if llm_elapsed else None,
             "queue_p95": percentile(llm_queue, 95),
         },
         "total_tokens": total_tokens,
+        "avg_tokens_per_call": avg_tokens,
+        "avg_prompt_chars": avg_prompt_chars,
+        "cache_hit_rate": cache_hit_rate,
         "qa": {
             "total": len(qa_rows),
             "followups": followup_count,
             "stance_counts": dict(stance_counts),
             "substantive_tactical_ratio": tactical_qa_ratio,
         },
+        "directives": {
+            "total_checked": directive_total,
+            "alignment_counts": dict(directive_alignments),
+            "dissent_rate": directive_dissent_rate,
+        },
         "governance_efficiency": {
             "review_to_report_ratio": review_to_report_ratio,
             "substantive_tactical_qa_ratio": tactical_qa_ratio,
+            "directive_dissent_rate": directive_dissent_rate,
         },
         "models": dict(model_counts),
         "projects": dict(project_counts),
@@ -580,9 +656,12 @@ def format_summary(summary: dict[str, Any]) -> str:
     ]
     lat = summary["latency_seconds"]
     if lat["p50"] is not None:
+        cache_pct = f"{summary['cache_hit_rate']:.0%}" if summary.get("cache_hit_rate") is not None else "n/a"
+        prompt_part = f" | avg_prompt={summary['avg_prompt_chars']}ch" if summary.get("avg_prompt_chars") else ""
         lines.append(
-            f"- **LLM Latency**: P50={lat['p50']}s, P95={lat['p95']}s, max={lat['max']}s "
-            f"(queue P95={lat['queue_p95']}s) | **Total Tokens**: {summary['total_tokens']}"
+            f"- **LLM Latency**: avg={lat['avg']}s, P50={lat['p50']}s, P95={lat['p95']}s, max={lat['max']}s "
+            f"(queue P95={lat['queue_p95']}s) | **Tokens**: {summary['total_tokens']:,} "
+            f"(avg={summary.get('avg_tokens_per_call')}, cache_hit={cache_pct}{prompt_part})"
         )
     if summary["models"]:
         lines.append(f"- **Models**: {summary['models']}")
@@ -596,6 +675,12 @@ def format_summary(summary: dict[str, Any]) -> str:
             f"- **Q&A**: total={summary['qa']['total']}, followups={summary['qa']['followups']}, "
             f"stances={summary['qa']['stance_counts']}{tac_part}"
         )
+    if summary.get("directives", {}).get("total_checked"):
+        d = summary["directives"]
+        lines.append(
+            f"- **Directive Pre-Mortems**: total={d['total_checked']}, alignments={d['alignment_counts']}, "
+            f"dissent_rate={d['dissent_rate']:.0%}"
+        )
     if summary["projects"]:
         lines.append(f"- **Projects**: {summary['projects']}")
     if summary["review_status_counts"]:
@@ -607,7 +692,7 @@ def format_summary(summary: dict[str, Any]) -> str:
     if summary["decision_counts"]:
         lines.append(f"- **Decisions**: {summary['decision_counts']}")
     if summary.get("project_efficiency"):
-        lines.extend(["", "## Project Efficiency & Anti-Spinning Audit"])
+        lines.extend(["", "## Project Efficiency, Anti-Spinning & Outcome Attribution"])
         for item in summary["project_efficiency"]:
             score_part = (
                 f"score={item['best_score']} (base={item['baseline_score']}, pass={item['pass_score']})"
@@ -617,12 +702,19 @@ def format_summary(summary: dict[str, Any]) -> str:
             gate_pct = f"{item['gate_eval_ratio']:.0%}" if item.get("gate_eval_ratio") is not None else "n/a"
             one_pct = f"{item['one_trial_plan_ratio']:.0%}" if item.get("one_trial_plan_ratio") is not None else "n/a"
             alert_part = f" | **ALERTS**: {', '.join(item['macro_alerts'])}" if item.get("macro_alerts") else ""
+            tr = item.get("track_record") or {}
+            tr_part = ""
+            if tr.get("evaluated_cycles") or tr.get("directive_checks"):
+                tr_part = (
+                    f" | outcomes={tr['verdict_counts']}, "
+                    f"dissent={tr['dissent_count']}(vindicated={tr['dissent_vindicated']}/refuted={tr['dissent_refuted']})"
+                )
             lines.append(
                 f"- `{item['id']}/{item['phase']}` ({item['phase_status']}, {score_part}): "
                 f"gate={item['gate_trials']}/{item['total_trials']} ({gate_pct}), "
                 f"since_gain={item['trials_since_last_improvement']}t/{item['cycles_since_last_improvement']}c/"
                 f"{item['pivots_since_last_improvement']}p, since_gate={item['trials_since_last_gate']}t, "
-                f"max_trials=1={one_pct}{alert_part}"
+                f"holds_streak={item.get('consecutive_holds', 0)}, max_trials=1={one_pct}{tr_part}{alert_part}"
             )
     if summary["feedback"]["total"]:
         lines.append(
@@ -638,6 +730,8 @@ def format_summary(summary: dict[str, Any]) -> str:
         for item in summary["recent"]:
             target = f"{item['project_id']}/{item['phase']}" if item.get("project_id") else (item.get("stance") or "qa")
             extra = item.get("decision") or item.get("review_status") or item.get("error") or ""
+            if item.get("directive_alignment"):
+                extra = f"{extra}:{item['directive_alignment']}"
             extra_part = f" [{extra}]" if extra else ""
             lines.append(
                 f"- `{item['invocation_id'][:10]}` {item['ts']} {item['mode']}:{item['action']} "
