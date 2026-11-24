@@ -77,9 +77,11 @@ def main(argv: list[str] | None = None) -> int:
 
     log_path = resolve_log_path(args.db)
     feedback_path = resolve_feedback_path(args.db)
+    effective_db = args.db if args.db is not None else (log_path.parent / "projects.sqlite3" if log_path else None)
     summary = summarize_logs(
         log_path,
         feedback_path,
+        db_path=effective_db,
         project_id=args.project,
         days=args.days,
         recent=args.recent,

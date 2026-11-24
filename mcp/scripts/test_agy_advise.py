@@ -25,6 +25,7 @@ from project import (  # noqa: E402
     Decision,
     Initialize,
     L3_DETAILED_TRIALS,
+    L3_EVIDENCE_CHARS,
     L3_RECENT_DECISIONS,
     L3_SUMMARY_TRIALS,
     ListProjects,
@@ -34,6 +35,7 @@ from project import (  # noqa: E402
     Review,
     Status,
     UpdateMemory,
+    build_efficiency_scorecard,
     build_three_tier_packet,
     decode_decision,
     handle_project,
@@ -1133,6 +1135,191 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
         prompt = advisor.calls[0]["prompt"]
         self.assertIn("L1_constitution.qualified_trial_id", prompt)
         self.assertIn("do not include qualified_trial_id in JSON", prompt)
+
+    async def test_cross_cycle_anti_spinning_macro_escalation_and_prompt_compaction(self):
+        init_evt = Initialize(
+            id="spin-demo",
+            phase="phase2",
+            action="init",
+            objective="Move real dynamic score from 2 to 7",
+            frozen_gate="Dynamic >= 7/8",
+            score_name="dynamic",
+            baseline_score=2,
+            pass_score=7,
+            stagnation_limit=2,
+            proxy_limit=3,
+            route="micro-route-0",
+        )
+        await handle_project(self.store, init_evt, FakeAdvisor([]), self.inv, "", None, 60, None, None)
+
+        # Simulate 4 consecutive 1-trial proxy-only cycles with PIVOTs (counter-laundering pattern)
+        for cycle in range(4):
+            next_route = f"micro-route-{cycle + 1}"
+            advisor = FakeAdvisor(
+                [
+                    json.dumps(
+                        {
+                            "decision": "PIVOT",
+                            "why": f"Micro tweak {cycle} did not help.",
+                            "hypothesis_family": "single-step-patch",
+                            "efficiency_rationale": "Try another small tweak.",
+                            "parallel_tracks": ["prepare-eval-harness"],
+                            "route": next_route,
+                            "next_trial": "X" * 900,  # intentionally verbose to verify L1 compaction
+                            "expected_signal": "Proxy improves",
+                            "stop_condition": "No proxy gain",
+                            "max_trials": 1,
+                        }
+                    )
+                ]
+            )
+            rep_res = await handle_project(
+                self.store,
+                Report(
+                    id="spin-demo",
+                    phase="phase2",
+                    action="report",
+                    trial_id=f"proxy-t{cycle}",
+                    route=f"micro-route-{cycle}",
+                    cycle=cycle,
+                    mechanism=f"mech-{cycle}",
+                    evidence_kind="diagnostic",
+                    evidence="E" * 1500,  # intentionally verbose to verify L3 compaction
+                    auto_review=False,
+                ),
+                advisor,
+                self.inv,
+                "",
+                None,
+                60,
+                None,
+                None,
+            )
+            if cycle >= 2:
+                # Cycle 2 is the 3rd consecutive non-gate trial across cycles -> global_proxy_drift!
+                self.assertIn("global_proxy_drift", rep_res["project"]["review_reasons"])
+            rev_res = await handle_project(
+                self.store,
+                Review(id="spin-demo", phase="phase2", action="review"),
+                advisor,
+                self.inv,
+                "",
+                None,
+                60,
+                None,
+                None,
+            )
+            self.assertEqual(rev_res["review_status"], "decided")
+            if cycle == 3:
+                prompt = advisor.calls[0]["prompt"]
+                self.assertIn("MACRO ESCALATION ACTIVE", prompt)
+                self.assertIn("pivot_churn", prompt)
+                self.assertIn("global_proxy_drift", prompt)
+                self.assertIn("single-step-patch", prompt)
+            await handle_project(
+                self.store,
+                Activate(
+                    id="spin-demo",
+                    phase="phase2",
+                    action="activate",
+                    decision_id=rev_res["project"]["last_decision"]["id"],
+                ),
+                advisor,
+                self.inv,
+                "",
+                None,
+                60,
+                None,
+                None,
+            )
+
+        with self.store.transaction() as db:
+            raw_state = self.store.load(db, init_evt)
+        scorecard = build_efficiency_scorecard(raw_state)
+        self.assertEqual(scorecard["gate_trials"], 0)
+        self.assertEqual(scorecard["trials_since_last_gate"], 4)
+        self.assertEqual(scorecard["pivots_since_last_improvement"], 4)
+        self.assertEqual(scorecard["one_trial_plan_ratio"], 1.0)
+        self.assertIn("pivot_churn", scorecard["macro_alerts"])
+        self.assertIn("global_proxy_drift", scorecard["macro_alerts"])
+        self.assertIn("micro_management_loop", scorecard["macro_alerts"])
+
+        # Verify packet compaction keeps L1 active_plan and L3 evidence strictly bounded
+        packet = build_three_tier_packet(raw_state)
+        self.assertLessEqual(len(packet["L1_constitution"]["active_plan"]["next_trial"]), 425)
+        self.assertLessEqual(
+            len(packet["L3_recent_working_memory"]["recent_evidence"][-1]["evidence"]),
+            L3_EVIDENCE_CHARS + 5,
+        )
+        # Full evidence remains intact in SQLite
+        self.assertEqual(len(raw_state["trials"]["proxy-t3"]["report"]["evidence"]), 1500)
+
+        # Taking a real improved gate score clears global_proxy_drift & resets trials_since_last_improvement
+        gate_res = await handle_project(
+            self.store,
+            Report(
+                id="spin-demo",
+                phase="phase2",
+                action="report",
+                trial_id="real-gate-1",
+                route="micro-route-4",
+                cycle=4,
+                mechanism="multi-step-rl",
+                score=5.0,
+                evidence="Real gate jumped to 5/8.",
+                auto_review=False,
+            ),
+            FakeAdvisor([]),
+            self.inv,
+            "",
+            None,
+            60,
+            None,
+            None,
+        )
+        eff = gate_res["project"]["efficiency"]
+        self.assertEqual(eff["trials_since_last_gate"], 0)
+        self.assertEqual(eff["trials_since_last_improvement"], 0)
+        self.assertNotIn("global_proxy_drift", eff["macro_alerts"])
+
+    async def test_telemetry_distinguishes_auth_failure_and_flags_governance_spinning(self):
+        advisor = FakeAdvisor(
+            [
+                RuntimeError("Antigravity CLI needs an authenticated session. Sign in with agy on this host."),
+                "tactical 1",
+                "tactical 2",
+                "tactical 3",
+                "tactical 4",
+                "tactical 5",
+            ]
+        )
+        with self.assertRaises(RuntimeError):
+            await execute_advise(
+                store=self.store,
+                advisor=advisor,
+                question="Long enough question that fails authentication before reaching the model.",
+            )
+        for idx in range(5):
+            await execute_advise(
+                store=self.store,
+                advisor=advisor,
+                question=f"Check local arithmetic detail #{idx} for a micro SOP step count boundary.",
+                stance="tactical",
+            )
+
+        rows = read_jsonl(self.log_path)
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(rows[0]["llm_attempted"])
+        self.assertFalse(rows[0]["llm_called"])
+        self.assertFalse(rows[0]["llm_responded"])
+        self.assertTrue(rows[1]["llm_called"])
+        self.assertTrue(rows[1]["llm_responded"])
+
+        summary = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path)
+        self.assertEqual(summary["llm_attempted_invocations"], 6)
+        self.assertEqual(summary["llm_invocations"], 5)
+        self.assertEqual(summary["llm_responded_invocations"], 5)
+        self.assertTrue(any("tactical Q&A share" in hint for hint in summary["tuning_hints"]))
 
 
 if __name__ == "__main__":

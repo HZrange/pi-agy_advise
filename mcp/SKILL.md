@@ -33,9 +33,10 @@ description: 用本机 Codex 的 agy_advise MCP 工具向 Google Antigravity 请
 | `effort` | 新会话可选推理档位（`low`/`medium`/`high`/`xhigh`/`max`），追问沿用原档位。 |
 | `model` | 新会话可选模型（如 `gemini-4-neon-high`），未传时读取 `AGY_ADVISE_MODEL`。追问沿用原模型。 |
 
-**提问原则**：
-- 把 Codex 自己的执行限制留在本地，只把影响技术判断的真实约束发给顾问。
-- 避免“帮我给这个局部微调定一个阈值（200字内）”这类框死视角的问法；应交代全局目标与此前失败，允许顾问回答“这个方向本身该停”。
+**提问原则与分工边界（战略归顾问，战术与算账归本地）**：
+- **严禁把 `agy_advise` 当成局部算账/微操审批员**：脚本参数、步数/批次算术对账、SHA/文件归档、微小的执行口径冲突全部由本地 Codex 自行解决，**禁止**反复用 `stance="tactical"` 追问细化预算或核对微观 SOP。
+- 把 Codex 自己的执行限制留在本地，只把影响全局技术与效率判断的真实约束发给顾问。
+- 避免“帮我给这个局部微调定一个阈值（200字内）”这类框死视角的问法；应交代全局目标、总成本/耗时和此前失败，允许顾问回答“这个方向或这个代理门本身该停，改走更直接/可并行的路径”。
 
 ---
 
@@ -55,29 +56,32 @@ description: 用本机 Codex 的 agy_advise MCP 工具向 Google Antigravity 请
 | `review` | 主动触发一次无菌室全局复盘，或重试先前超时/无效的复盘。常规解封/短验复查建议传 `effort: "medium"` 提速，重大停滞或换路复盘用默认/高档位。 |
 | `activate` | 用当前 `decision_id` 激活 `CONTINUE` 或 `PIVOT` 裁决的新轮次、路线与次数预算，清空 `pending_unblock` 并重新开放 `dispatch_allowed`。 |
 
-### 自动拉停与反死胡同触发器
+### 自动拉停与反死胡同触发器（含跨周期宏观护栏）
 
 满足以下任一条件时，工具先持久化入账，将 `project.dispatch_allowed` 置为 `false`，并自动发起复盘（除非 `auto_review: false` 延迟到手动 `review`）：
-1. `stagnation`：达到 `stagnation_limit` 个不同 `mechanism` 均未实质推进门槛；
+1. `stagnation`：单周期内达到 `stagnation_limit` 个不同 `mechanism` 均未实质推进门槛；
 2. `same_mechanism_spin`：同一个 `mechanism` 连续空转达到 `same_mechanism_limit` 次（堵住单机制反复微调漏洞）；
-3. `proxy_drift`：连续 `proxy_limit` 次只报代理/未评分证据、未跑真实门槛评测（堵住刷离线指标的伪进展）；
-4. `protected_regression`：任一保护项/红线回归；
-5. `blocker`：上报 `outcome: "blocked"`；
-6. `budget_exhausted`：当前轮次达到已激活计划的 `max_trials`；
-7. `review_cadence`：达到设定的周期性强制体检步数；
-8. `qualified_result`：出现满足冻结门槛的验收结果，须复核后才可 `ADVANCE`。
+3. `proxy_drift` / `global_proxy_drift`：单周期或**跨周期累计**（`activate` 不会洗白）连续 `proxy_limit` 次只报代理/诊断证据、未跑真实门槛评测（堵住“每轮改个路线名就洗白代理空转”的漏洞）；
+4. `macro_stagnation` / `pivot_churn`：**跨周期累计**长期未推进真实门槛（默认 ≥6 次试验或 ≥3 次 `PIVOT` 仍无真分进展），自动把复盘切入 **`MACRO ESCALATION` 宏观重置模式**，禁止再发局部微补丁或换皮 `PIVOT`，强制在大尺度结构换路、直取端到端真分或升级请示用户之间抉择；
+5. `protected_regression`：任一保护项/红线回归；
+6. `blocker`：上报 `outcome: "blocked"`；
+7. `budget_exhausted`：当前轮次达到已激活计划的 `max_trials`；
+8. `review_cadence`：达到设定的周期性强制体检步数；
+9. `qualified_result`：出现满足冻结门槛的验收结果，须复核后才可 `ADVANCE`。
 
-### 三层外置记忆 + 无菌室复盘协议（Three-Tier Memory + Clean-Room）
+### 三层外置记忆 + 效率记分卡 + 无菌室复盘协议
 
 - **绝不复用长聊天历史**：`project` 模式禁止传 `session_id` 和 `stance`，每次复盘必开干净会话，彻底避免沉没成本锚定与上下文滚雪球。
-- **O(1) 有界三层外置记忆包**（存在本地 SQLite，不随项目运行半年而膨胀）：
-  1. **L1 宪法层（永不压缩）**：`objective`、`frozen_gate`、`non_negotiables`、`active_plan` 及生效中的 `pending_unblock` 解封核销清单；
-  2. **L2 蒸馏记忆层（长期核心认知，各限 12 条）**：`route_postmortems`（每条已放弃路线的 1–2 句证伪结论）、`verified_facts`（跨轮证实的硬事实）与 `route_stats`（各路线聚合统计），每次复盘自动沉淀且可用 `action: "memory"` 人工校正；
-  3. **L3 近期工作记忆层（滑动窗口）**：最近 4 条裁决、最近 20 条试验摘要、最近 6 条详细证据。
-- **截停即开处方 + 复审核销**：
-  - `CONTINUE`/`PIVOT` 强制包含 `route`、`next_trial`、`expected_signal`、`stop_condition`、`max_trials`；
-  - `HOLD` **代码级强制包含** `unblock_actions`（1–3 项具体修复/排查动作）与 `unblock_criteria`（重新申请放行的最小可验证证据），并挂入 `project.pending_unblock`；下次 `review` 时自动置顶，强制顾问逐项核销后才能解封；
-  - 调用 `review` 时不要在 `question` 里替顾问提前定调（例如不要写“请裁决 HOLD”），只陈述新事实，把裁决权完整留给顾问。
+- **O(1) 有界三层外置记忆包**（存在本地 SQLite，发送给顾问时自动压缩微观噪声，保留高信噪比全局视图）：
+  1. **L1 宪法层（永不压缩）**：`objective`、`frozen_gate`、`non_negotiables`、**跨周期 `efficiency_scorecard`**（真实门槛评测占比、距上次真分提升的试验/周期/`PIVOT` 数、距上次真分评测的试验数、`max_trials=1` 占比及 `macro_alerts`）、精简版 `active_plan` 及生效中的 `pending_unblock`；
+  2. **L2 蒸馏记忆层（战略级认知，各限 12 条）**：`route_postmortems`（已放弃路线的 1–2 句证伪结论）、`tried_hypothesis_families`（已试策略大类，防止同大类换皮 `PIVOT`）、`verified_facts`（只沉淀跨轮因果规律，**不塞单次运行的 SHA、拍号或原始报表**）与 `route_stats`；
+  3. **L3 近期工作记忆层（紧凑滑动窗口）**：最近 4 条裁决、最近 16 条试验摘要、最近 4 条压缩证据（完整原文仍持久化在 SQLite）。
+- **战略授权而非保姆式微操**：
+  - `CONTINUE`/`PIVOT` 强制包含 `route`、`next_trial`、`expected_signal`、`stop_condition`、`max_trials`，并建议给出 `hypothesis_family`、`efficiency_rationale` 与 `parallel_tracks`（可并行推进的非阻塞工作流）；
+  - 实质路线默认授权 `max_trials = 2–5` 的连续跑道，避免每跑 1 次就停下来审一次；仅单次高成本/不可逆验收或前置阻塞才用 `max_trials = 1`；
+  - `next_trial` 只锁定假设、核心机制变化、高层预算与证伪条件，不替本地写脆弱的多阶段微观算术 SOP；
+  - `HOLD` **代码级强制包含** `unblock_actions`（1–3 项具体修复/排查动作）与 `unblock_criteria`（重新申请放行的最小可验证证据），并挂入 `project.pending_unblock`；下次 `review` 时自动置顶核销；
+  - 调用 `review` 时不要在 `question` 里替顾问提前定调，只陈述事实与约束。
 - 每次派发新任务前检查 `project.dispatch_allowed`；为 `false` 时暂停新派发，但继续据实上报已完成的在途任务。超时或新证据并发到达时，待复盘状态保留且旧裁决自动作废（`stale`），重启 MCP 后可直接 `review` 续接。
 
 ### 跨领域调用示例

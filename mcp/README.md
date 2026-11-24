@@ -13,12 +13,12 @@
 
 ## 功能
 
-- 默认全局审查，也可使用 `red_team` 或 `tactical` 立场。
+- 默认全局审查，也可使用 `red_team` 或 `tactical` 立场，强调端到端效率（单位算力与墙钟时间进展）与并行化拆分。
 - 数值指标越高越好、越低越好，以及无分数的定性里程碑。
-- 停滞、单机制空转、代理指标漂移、保护项回归、阻塞、预算耗尽和周期复核触发器。
-- `CONTINUE` / `PIVOT` 行动预算，`HOLD` 强制解封动作与最小证据，激活前保持禁止派发。
-- L1 宪法、L2 蒸馏事实与路线尸检、L3 近期窗口；每次复盘使用干净会话。
-- `invocations.jsonl` 调用审计、`feedback.jsonl` 事后质量打标和本地汇总报表。
+- 单周期与**跨周期**防空转护栏：停滞、单机制空转、单周期/跨周期代理漂移（`global_proxy_drift`）、跨周期宏观停滞（`macro_stagnation`）、频繁换皮转向（`pivot_churn`）、微操循环告警（`micro_management_loop`）、保护项回归、阻塞、预算耗尽和周期复核。
+- `CONTINUE` / `PIVOT` 战略授权与连续跑道（`hypothesis_family`、`efficiency_rationale`、`parallel_tracks`、`max_trials`），`HOLD` 强制解封动作与最小证据，激活前保持禁止派发。
+- L1 宪法 + 效率记分卡、L2 蒸馏战略事实与路线尸检、L3 紧凑近期窗口；每次复盘使用干净会话，触发宏观告警时自动切入宏观重置模式。
+- `invocations.jsonl` 调用审计（区分 `llm_attempted`/`llm_called`/`llm_responded`）、`feedback.jsonl` 事后质量打标，以及结合 `projects.sqlite3` 的项目效率与反空转汇总报表。
 
 ## 前置条件
 

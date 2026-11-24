@@ -4,10 +4,14 @@ import json
 import math
 import os
 import re
+import sqlite3
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from project import build_efficiency_scorecard, normalize_state
 
 try:
     import fcntl
@@ -26,6 +30,12 @@ FEEDBACK_LABELS = (
 _DISABLE_VALUES = {"off", "0", "false", "no", "none"}
 _ENABLE_VALUES = {"1", "true", "yes", "on"}
 _WS_RE = re.compile(r"\s+")
+_PRE_MODEL_ERROR_MARKERS = (
+    "authenticated session",
+    "waiting for the previous advisor turn",
+    "closed its input before receiving",
+    "unknown advisor session",
+)
 
 
 def utc_now() -> str:
@@ -128,17 +138,31 @@ def build_invocation_record(
     effective_effort = resp.get("requested_effort") if resp.get("requested_effort") is not None else effort
     effective_session = resp.get("session_id") if isinstance(resp.get("session_id"), str) else session_id
 
-    llm_called = bool(
+    error_text = error or (resp.get("error") if isinstance(resp.get("error"), str) else None)
+    error_lower = (error_text or "").lower()
+    pre_model_error = any(marker in error_lower for marker in _PRE_MODEL_ERROR_MARKERS)
+
+    llm_attempted = bool(
         (mode == "qa" and status != "validation_error")
         or (
             mode == "project"
             and review_status in ("decided", "stale", "transport_error", "invalid_decision")
         )
     )
+    llm_responded = bool(
+        advice is not None or usage is not None or resp.get("duration_seconds") is not None
+    )
+    llm_called = bool(llm_attempted and (llm_responded or not pre_model_error))
 
     decision_value = None
+    decision_max_trials = None
+    hypothesis_family = None
     if review_status == "decided" and isinstance(last_decision.get("decision"), str):
         decision_value = last_decision["decision"]
+        if isinstance(last_decision.get("max_trials"), int):
+            decision_max_trials = last_decision["max_trials"]
+        if isinstance(last_decision.get("hypothesis_family"), str):
+            hypothesis_family = last_decision["hypothesis_family"]
 
     record: dict[str, Any] = {
         "ts": utc_now(),
@@ -146,7 +170,9 @@ def build_invocation_record(
         "mode": mode,
         "action": action,
         "status": status,
+        "llm_attempted": llm_attempted,
         "llm_called": llm_called,
+        "llm_responded": llm_responded,
         "elapsed_seconds": round(max(elapsed_seconds, 0.0), 3),
         "queue_seconds": resp.get("queue_seconds"),
         "duration_seconds": resp.get("duration_seconds"),
@@ -166,13 +192,15 @@ def build_invocation_record(
         "review_status": review_status,
         "review_reasons": proj.get("review_reasons") if isinstance(proj.get("review_reasons"), list) else [],
         "decision": decision_value,
+        "decision_max_trials": decision_max_trials,
+        "hypothesis_family": hypothesis_family,
         "dispatch_allowed": proj.get("dispatch_allowed"),
         "question_chars": len(question or ""),
         "context_chars": len(context or ""),
         "advice_chars": len(advice) if advice is not None else 0,
         "question_preview": preview_text(question, 240),
         "advice_preview": preview_text(advice, 320),
-        "error": preview_text(error or (resp.get("error") if isinstance(resp.get("error"), str) else None), 400),
+        "error": preview_text(error_text, 400),
     }
 
     full = log_full_enabled() if include_full is None else include_full
@@ -258,10 +286,49 @@ def _parse_ts(raw: Any) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+def _read_project_efficiency(db_path: Path | None, project_id: str | None = None) -> list[dict[str, Any]]:
+    if db_path is None or not db_path.exists():
+        return []
+    uri = f"file:{db_path.resolve()}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+            if project_id is not None:
+                rows = db.execute(
+                    "SELECT record FROM projects WHERE id = ? ORDER BY id, phase",
+                    (project_id,),
+                ).fetchall()
+            else:
+                rows = db.execute("SELECT record FROM projects ORDER BY id, phase").fetchall()
+    except sqlite3.Error:
+        return []
+
+    items: list[dict[str, Any]] = []
+    for (record,) in rows:
+        try:
+            state = normalize_state(json.loads(record))
+        except (TypeError, ValueError):
+            continue
+        scorecard = build_efficiency_scorecard(state)
+        items.append(
+            {
+                "id": state.get("id"),
+                "phase": state.get("phase"),
+                "phase_status": state.get("phase_status"),
+                "score_name": state.get("score_name"),
+                "baseline_score": state.get("baseline_score"),
+                "best_score": state.get("best_score"),
+                "pass_score": state.get("pass_score"),
+                **scorecard,
+            }
+        )
+    return items
+
+
 def summarize_logs(
     log_path: Path | None,
     feedback_path: Path | None = None,
     *,
+    db_path: Path | None = None,
     project_id: str | None = None,
     days: int | None = None,
     recent: int = 8,
@@ -323,7 +390,29 @@ def summarize_logs(
             trigger_counts["explicit_review"] += 1
     decision_counts = Counter(row["decision"] for row in filtered if row.get("decision"))
 
-    llm_rows = [row for row in filtered if row.get("llm_called")]
+    def _row_responded(row: dict[str, Any]) -> bool:
+        if "llm_responded" in row:
+            return bool(row["llm_responded"])
+        return bool(
+            row.get("llm_called")
+            and (
+                row.get("duration_seconds") is not None
+                or row.get("usage") is not None
+                or (row.get("advice_chars") or 0) > 0
+            )
+        )
+
+    def _row_pre_model_error(row: dict[str, Any]) -> bool:
+        err = (row.get("error") or "").lower()
+        return bool(err and any(marker in err for marker in _PRE_MODEL_ERROR_MARKERS))
+
+    llm_attempted_rows = [row for row in filtered if row.get("llm_attempted", row.get("llm_called"))]
+    llm_responded_rows = [row for row in filtered if _row_responded(row)]
+    llm_rows = [
+        row
+        for row in filtered
+        if row.get("llm_called") and (_row_responded(row) or not _row_pre_model_error(row))
+    ]
     llm_elapsed = [float(row["elapsed_seconds"]) for row in llm_rows if isinstance(row.get("elapsed_seconds"), (int, float))]
     llm_queue = [float(row["queue_seconds"]) for row in llm_rows if isinstance(row.get("queue_seconds"), (int, float))]
     total_tokens = 0
@@ -333,8 +422,24 @@ def summarize_logs(
             total_tokens += int(usage["total_tokens"])
 
     qa_rows = [row for row in filtered if row.get("mode") == "qa"]
+    substantive_qa_rows = [row for row in qa_rows if (row.get("question_chars") or 0) > 20]
+    tactical_qa_count = sum(1 for row in substantive_qa_rows if row.get("stance") == "tactical")
+    tactical_qa_ratio = (
+        round(tactical_qa_count / len(substantive_qa_rows), 3) if substantive_qa_rows else None
+    )
     followup_count = sum(1 for row in qa_rows if row.get("is_followup"))
     timeout_count = sum(1 for row in llm_rows if row.get("status") == "timeout" or row.get("review_status") == "transport_error")
+
+    report_count = action_counts["project:report"]
+    decided_review_count = review_status_counts["decided"]
+    review_to_report_ratio = round(decided_review_count / report_count, 3) if report_count else None
+
+    effective_db = db_path
+    if effective_db is None and log_path is not None:
+        candidate = log_path.parent / "projects.sqlite3"
+        if candidate.exists():
+            effective_db = candidate
+    project_efficiency = _read_project_efficiency(effective_db, project_id=project_id)
 
     feedback_counts = Counter(fb.get("label", "unknown") for fb in filtered_feedback)
     feedback_by_stance: dict[str, dict[str, int]] = {}
@@ -364,6 +469,27 @@ def summarize_logs(
             f"Frequent stale reviews ({review_status_counts['stale']}/{review_attempts}): "
             "use auto_review=false when parallel trials finish together, then run a single review."
         )
+    if len(substantive_qa_rows) >= 5 and (tactical_qa_ratio or 0.0) >= 0.5:
+        hints.append(
+            f"High tactical Q&A share ({tactical_qa_count}/{len(substantive_qa_rows)} = {tactical_qa_ratio:.0%}): "
+            "avoid delegating local arithmetic/SOP details to agy_advise; reserve calls for global/red_team decisions."
+        )
+    if report_count >= 5 and (review_to_report_ratio or 0.0) >= 0.8:
+        hints.append(
+            f"Near 1:1 review-to-report ratio ({decided_review_count}/{report_count} = {review_to_report_ratio:.2f}): "
+            "stop micromanaging with max_trials=1; grant 2-5 trial runways for substantive routes."
+        )
+    for item in project_efficiency:
+        alerts = item.get("macro_alerts") or []
+        if alerts:
+            hints.append(
+                f"Project {item['id']}/{item['phase']} spinning alerts [{', '.join(alerts)}]: "
+                f"gate_trials={item['gate_trials']}/{item['total_trials']}, "
+                f"since_improvement={item['trials_since_last_improvement']} trials / "
+                f"{item['pivots_since_last_improvement']} pivots, "
+                f"since_last_gate={item['trials_since_last_gate']}, "
+                f"max_trials=1={item['one_trial_plans']}/{item['planned_cycles']}."
+            )
     if feedback_counts["rubber_stamp"] > 0:
         hints.append(
             f"{feedback_counts['rubber_stamp']} rubber_stamp feedback item(s): "
@@ -397,9 +523,12 @@ def summarize_logs(
     return {
         "log_path": str(log_path) if log_path else None,
         "feedback_path": str(feedback_path) if feedback_path else None,
+        "db_path": str(effective_db) if effective_db else None,
         "filters": {"project_id": project_id, "days": days},
         "total_invocations": len(filtered),
         "llm_invocations": len(llm_rows),
+        "llm_attempted_invocations": len(llm_attempted_rows),
+        "llm_responded_invocations": len(llm_responded_rows),
         "mode_counts": dict(mode_counts),
         "action_counts": dict(action_counts),
         "status_counts": dict(status_counts),
@@ -416,9 +545,15 @@ def summarize_logs(
             "total": len(qa_rows),
             "followups": followup_count,
             "stance_counts": dict(stance_counts),
+            "substantive_tactical_ratio": tactical_qa_ratio,
+        },
+        "governance_efficiency": {
+            "review_to_report_ratio": review_to_report_ratio,
+            "substantive_tactical_qa_ratio": tactical_qa_ratio,
         },
         "models": dict(model_counts),
         "projects": dict(project_counts),
+        "project_efficiency": project_efficiency,
         "review_status_counts": dict(review_status_counts),
         "trigger_counts": dict(trigger_counts),
         "decision_counts": dict(decision_counts),
@@ -437,7 +572,9 @@ def format_summary(summary: dict[str, Any]) -> str:
         "# agy_advise Invocation & Feedback Report",
         "",
         f"- **Log**: `{summary['log_path']}`",
-        f"- **Total Invocations**: {summary['total_invocations']} (LLM calls: {summary['llm_invocations']})",
+        f"- **Total Invocations**: {summary['total_invocations']} "
+        f"(LLM attempted: {summary.get('llm_attempted_invocations', summary['llm_invocations'])}, "
+        f"called: {summary['llm_invocations']}, responded: {summary.get('llm_responded_invocations', 0)})",
         f"- **Modes**: {summary['mode_counts'] or '{}'}",
         f"- **Statuses**: {summary['status_counts'] or '{}'} (timeout/transport rate: {summary['timeout_rate']:.1%})",
     ]
@@ -450,18 +587,43 @@ def format_summary(summary: dict[str, Any]) -> str:
     if summary["models"]:
         lines.append(f"- **Models**: {summary['models']}")
     if summary["qa"]["total"]:
+        tac_part = (
+            f", substantive_tactical={summary['qa']['substantive_tactical_ratio']:.0%}"
+            if summary["qa"].get("substantive_tactical_ratio") is not None
+            else ""
+        )
         lines.append(
             f"- **Q&A**: total={summary['qa']['total']}, followups={summary['qa']['followups']}, "
-            f"stances={summary['qa']['stance_counts']}"
+            f"stances={summary['qa']['stance_counts']}{tac_part}"
         )
     if summary["projects"]:
         lines.append(f"- **Projects**: {summary['projects']}")
     if summary["review_status_counts"]:
-        lines.append(f"- **Project Review Statuses**: {summary['review_status_counts']}")
+        ratio = summary.get("governance_efficiency", {}).get("review_to_report_ratio")
+        ratio_part = f" | review/report={ratio:.2f}" if ratio is not None else ""
+        lines.append(f"- **Project Review Statuses**: {summary['review_status_counts']}{ratio_part}")
     if summary["trigger_counts"]:
         lines.append(f"- **Review Triggers**: {summary['trigger_counts']}")
     if summary["decision_counts"]:
         lines.append(f"- **Decisions**: {summary['decision_counts']}")
+    if summary.get("project_efficiency"):
+        lines.extend(["", "## Project Efficiency & Anti-Spinning Audit"])
+        for item in summary["project_efficiency"]:
+            score_part = (
+                f"score={item['best_score']} (base={item['baseline_score']}, pass={item['pass_score']})"
+                if item.get("score_name")
+                else "qualitative"
+            )
+            gate_pct = f"{item['gate_eval_ratio']:.0%}" if item.get("gate_eval_ratio") is not None else "n/a"
+            one_pct = f"{item['one_trial_plan_ratio']:.0%}" if item.get("one_trial_plan_ratio") is not None else "n/a"
+            alert_part = f" | **ALERTS**: {', '.join(item['macro_alerts'])}" if item.get("macro_alerts") else ""
+            lines.append(
+                f"- `{item['id']}/{item['phase']}` ({item['phase_status']}, {score_part}): "
+                f"gate={item['gate_trials']}/{item['total_trials']} ({gate_pct}), "
+                f"since_gain={item['trials_since_last_improvement']}t/{item['cycles_since_last_improvement']}c/"
+                f"{item['pivots_since_last_improvement']}p, since_gate={item['trials_since_last_gate']}t, "
+                f"max_trials=1={one_pct}{alert_part}"
+            )
     if summary["feedback"]["total"]:
         lines.append(
             f"- **Feedback ({summary['feedback']['total']})**: {summary['feedback']['label_counts']} "

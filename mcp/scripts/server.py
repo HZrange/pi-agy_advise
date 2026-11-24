@@ -66,26 +66,35 @@ def build_advice_prompt(
         sections.append(
             "Stance (Red-Team Audit): Construct the strongest evidence-based case for why the proposed "
             "approach, architecture, or hypothesis will fail to achieve the real end goal. Identify hidden "
-            "assumptions, proxy-vs-real-goal traps, and single points of failure. Name the cheapest "
-            "falsifying check and state clearly whether this branch should stop or pivot."
+            "assumptions, proxy-vs-real-goal traps, single points of failure, and efficiency traps "
+            "(spending more time/compute on indirect proxies or micro-patches than a direct end-to-end "
+            "test or structural fix would cost). Name the cheapest falsifying check and state clearly "
+            "whether this branch should stop or pivot."
         )
     elif stance == "tactical":
         sections.append(
-            "Stance (Focused Tactical): Answer directly from first principles for the stated scope. "
-            "Still flag any glaring premise flaw or contradiction in the evidence, distinguish confirmed "
-            "facts from assumptions, and state concrete pass/stop criteria."
+            "Stance (Focused Tactical): First check in 1-2 sentences whether this tactical question "
+            "reflects over-constrained micromanagement or optimizing a dead-end proxy; if so, warn "
+            "clearly. Then answer directly from first principles for the stated scope, distinguish "
+            "confirmed facts from assumptions, and state concrete pass/stop criteria without "
+            "over-prescribing brittle local accounting details."
         )
     elif not is_followup:
         sections.append(
             "Stance (Global-First Independent Reviewer):\n"
-            "1. Zoom out before zooming in: first check whether the question frames a local symptom or "
-            "sunk-cost patch rather than the real main bottleneck against the overarching goal.\n"
-            "2. Do not rubber-stamp proposed options: derive the right direction from first principles "
+            "1. Zoom out before zooming in: first check whether the question frames a local symptom, "
+            "unverified proxy, or sunk-cost patch rather than the real main bottleneck against the "
+            "overarching goal.\n"
+            "2. Optimize for global efficiency (real end-to-end progress per unit compute + wall-clock "
+            "turnaround): call out over-engineering, low-ROI micro-tuning, unverified proxy gates, or "
+            "serial bottlenecks that should be simplified, tested directly, or parallelized.\n"
+            "3. Do not rubber-stamp proposed options: derive the right direction from first principles "
             "using the goal, hard constraints, and observed failures. You are explicitly authorized to "
             "challenge the premise or recommend stopping/pivoting the current branch.\n"
-            "3. Separate confirmed facts, inferences, and critical unknowns that could overturn your judgment.\n"
-            "4. Give a decisive recommendation, the single highest-leverage next step, and a concrete "
-            "falsification or stop condition. Match the language of the question."
+            "4. Separate confirmed facts, inferences, and critical unknowns that could overturn your judgment.\n"
+            "5. Give a decisive strategic recommendation, the highest-leverage next step (plus any "
+            "independent parallel tracks), and a concrete falsification or stop condition. Leave local "
+            "implementation arithmetic/flags to the executor. Match the language of the question."
         )
     return "\n\n".join(sections)
 
