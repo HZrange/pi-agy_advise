@@ -183,9 +183,21 @@ def build_invocation_record(
     ro_read = resp.get("readonly_files_read") if isinstance(resp.get("readonly_files_read"), list) else []
     ro_denied = resp.get("readonly_denied_calls") if isinstance(resp.get("readonly_denied_calls"), list) else []
     ro_bytes = resp.get("readonly_files_bytes") if isinstance(resp.get("readonly_files_bytes"), int) else 0
+    ro_mode = resp.get("readonly_grounding_mode") if isinstance(resp.get("readonly_grounding_mode"), str) else (
+        "staged_hook" if ro_staged else None
+    )
     is_dir_change = resp.get("is_direction_change")
     if is_dir_change is None and isinstance(last_decision.get("is_direction_change"), bool):
         is_dir_change = last_decision["is_direction_change"]
+    caution_soft_dissent = bool(
+        resp.get("caution_with_dissent_points")
+        or (review_status == "decided" and last_decision.get("caution_with_dissent_points"))
+    )
+    auto_escalated = bool(
+        resp.get("auto_escalated_dissent")
+        or (review_status == "decided" and last_decision.get("auto_escalated_dissent"))
+    )
+    raw_resp_chars = resp.get("raw_response_chars") if isinstance(resp.get("raw_response_chars"), int) else None
 
     record: dict[str, Any] = {
         "ts": utc_now(),
@@ -218,10 +230,13 @@ def build_invocation_record(
         "decision": decision_value,
         "directive_alignment": directive_alignment,
         "is_direction_change": bool(is_dir_change) if action == "directive" else None,
+        "caution_with_dissent_points": caution_soft_dissent if action == "directive" else False,
+        "auto_escalated_dissent": auto_escalated if action == "directive" else False,
         "dissent_raised": dissent_raised,
         "decision_max_trials": decision_max_trials,
         "hypothesis_family": hypothesis_family,
         "dispatch_allowed": proj.get("dispatch_allowed"),
+        "readonly_grounding_mode": ro_mode,
         "readonly_files_count": len(ro_staged),
         "readonly_files_bytes": ro_bytes,
         "readonly_files_staged": ro_staged,
@@ -231,6 +246,7 @@ def build_invocation_record(
         "context_chars": len(context or ""),
         "prompt_chars": effective_prompt_chars if isinstance(effective_prompt_chars, int) else None,
         "advice_chars": len(advice) if advice is not None else 0,
+        "raw_response_chars": raw_resp_chars,
         "question_preview": preview_text(question, 240),
         "advice_preview": preview_text(advice, 320),
         "error": preview_text(error_text, 400),
@@ -494,8 +510,24 @@ def summarize_logs(
     timeout_count = sum(1 for row in llm_rows if row.get("status") == "timeout" or row.get("review_status") == "transport_error")
 
     report_count = action_counts["project:report"]
-    decided_review_count = review_status_counts["decided"]
-    review_to_report_ratio = round(decided_review_count / report_count, 3) if report_count else None
+    decided_review_only_count = sum(
+        1
+        for row in filtered
+        if row.get("mode") == "project"
+        and row.get("action") in ("review", "report")
+        and row.get("review_status") == "decided"
+    )
+    decided_directive_count = sum(
+        1
+        for row in filtered
+        if row.get("mode") == "project"
+        and row.get("action") == "directive"
+        and row.get("review_status") == "decided"
+    )
+    decided_total_count = review_status_counts["decided"]
+    review_to_report_ratio = round(decided_review_only_count / report_count, 3) if report_count else None
+    directive_to_report_ratio = round(decided_directive_count / report_count, 3) if report_count else None
+    decided_to_report_ratio = round(decided_total_count / report_count, 3) if report_count else None
 
     directive_total = sum(directive_alignments.values())
     directive_dissent_rate = (
@@ -508,8 +540,26 @@ def summarize_logs(
         and row.get("action") == "directive"
         and row.get("is_direction_change") is True
     )
+    caution_with_dissent_count = sum(
+        1
+        for row in filtered
+        if row.get("mode") == "project"
+        and row.get("action") == "directive"
+        and row.get("caution_with_dissent_points") is True
+    )
+    auto_escalated_dissent_count = sum(
+        1
+        for row in filtered
+        if row.get("mode") == "project"
+        and row.get("action") == "directive"
+        and row.get("auto_escalated_dissent") is True
+    )
 
     ro_grounded_rows = [row for row in llm_rows if (row.get("readonly_files_count") or 0) > 0]
+    ro_inline_calls = sum(1 for row in ro_grounded_rows if row.get("readonly_grounding_mode") == "inline")
+    ro_staged_calls = sum(
+        1 for row in ro_grounded_rows if row.get("readonly_grounding_mode") in ("staged_hook", None)
+    )
     ro_total_staged = sum(int(row.get("readonly_files_count") or 0) for row in ro_grounded_rows)
     ro_total_read = sum(len(row.get("readonly_files_read") or []) for row in ro_grounded_rows)
     ro_total_denied = sum(int(row.get("readonly_denied_calls") or 0) for row in filtered)
@@ -556,8 +606,13 @@ def summarize_logs(
         )
     if report_count >= 5 and (review_to_report_ratio or 0.0) >= 0.8:
         hints.append(
-            f"Near 1:1 review-to-report ratio ({decided_review_count}/{report_count} = {review_to_report_ratio:.2f}): "
+            f"Near 1:1 review-to-report ratio ({decided_review_only_count}/{report_count} = {review_to_report_ratio:.2f}): "
             "stop micromanaging with max_trials=1 or hard-stopping soft regressions; use directive / soft severity / 2-5 trial runways."
+        )
+    if decided_directive_count >= 3 and (report_count == 0 or (directive_to_report_ratio or 0.0) >= 1.0):
+        hints.append(
+            f"Directive churn detected ({decided_directive_count} directives vs {report_count} reports): "
+            "avoid chaining rapid direction switches without running trials/gate checks; suspend & fork if the north-star gate shifted."
         )
     if (avg_prompt_chars or 0) > 18000 or (avg_elapsed or 0.0) > 75.0:
         hints.append(
@@ -567,6 +622,11 @@ def summarize_logs(
     if directive_total >= 5 and directive_alignments["caution"] == 0 and directive_alignments["dissent"] == 0:
         hints.append(
             f"Potential rubber-stamp risk: {directive_total}/{directive_total} directive checks returned 'concur' with zero caution/dissent."
+        )
+    if caution_with_dissent_count >= 3 and directive_alignments["dissent"] == 0:
+        hints.append(
+            f"Caution-creep detected: {caution_with_dissent_count}/{directive_total} directive checks raised dissent_points "
+            "but softened alignment to 'caution' instead of pausing with 'dissent'."
         )
     if len(ro_grounded_rows) >= 3 and ro_total_read == 0:
         hints.append(
@@ -656,16 +716,22 @@ def summarize_logs(
             "total_checked": directive_total,
             "direction_changes": direction_change_checks,
             "alignment_counts": dict(directive_alignments),
+            "caution_with_dissent_points": caution_with_dissent_count,
+            "auto_escalated_dissent": auto_escalated_dissent_count,
             "dissent_rate": directive_dissent_rate,
         },
         "readonly_grounding": {
             "grounded_calls": len(ro_grounded_rows),
+            "inline_calls": ro_inline_calls,
+            "staged_hook_calls": ro_staged_calls,
             "files_staged": ro_total_staged,
             "files_read": ro_total_read,
             "denied_tool_attempts": ro_total_denied,
         },
         "governance_efficiency": {
             "review_to_report_ratio": review_to_report_ratio,
+            "directive_to_report_ratio": directive_to_report_ratio,
+            "decided_to_report_ratio": decided_to_report_ratio,
             "substantive_tactical_qa_ratio": tactical_qa_ratio,
             "directive_dissent_rate": directive_dissent_rate,
         },
@@ -719,22 +785,40 @@ def format_summary(summary: dict[str, Any]) -> str:
         )
     if summary.get("directives", {}).get("total_checked"):
         d = summary["directives"]
+        soft_part = (
+            f", soft_dissent_caution={d['caution_with_dissent_points']}"
+            if d.get("caution_with_dissent_points")
+            else ""
+        )
+        esc_part = (
+            f", auto_escalated={d['auto_escalated_dissent']}"
+            if d.get("auto_escalated_dissent")
+            else ""
+        )
         lines.append(
             f"- **Directive Pre-Mortems**: total={d['total_checked']} (direction_changes={d.get('direction_changes', 0)}), "
-            f"alignments={d['alignment_counts']}, dissent_rate={d['dissent_rate']:.0%}"
+            f"alignments={d['alignment_counts']}, dissent_rate={d['dissent_rate']:.0%}{soft_part}{esc_part}"
         )
     if summary.get("readonly_grounding", {}).get("grounded_calls"):
         rg = summary["readonly_grounding"]
         lines.append(
-            f"- **Read-Only Grounding**: grounded_calls={rg['grounded_calls']}, "
+            f"- **Read-Only Grounding**: grounded_calls={rg['grounded_calls']} "
+            f"(inline={rg.get('inline_calls', 0)}, staged_hook={rg.get('staged_hook_calls', 0)}), "
             f"files_staged={rg['files_staged']}, files_read={rg['files_read']}, "
             f"denied_attempts={rg['denied_tool_attempts']}"
         )
     if summary["projects"]:
         lines.append(f"- **Projects**: {summary['projects']}")
     if summary["review_status_counts"]:
-        ratio = summary.get("governance_efficiency", {}).get("review_to_report_ratio")
-        ratio_part = f" | review/report={ratio:.2f}" if ratio is not None else ""
+        ge = summary.get("governance_efficiency", {})
+        ratio = ge.get("review_to_report_ratio")
+        dir_ratio = ge.get("directive_to_report_ratio")
+        parts = []
+        if ratio is not None:
+            parts.append(f"review/report={ratio:.2f}")
+        if dir_ratio is not None and dir_ratio > 0:
+            parts.append(f"directive/report={dir_ratio:.2f}")
+        ratio_part = (" | " + ", ".join(parts)) if parts else ""
         lines.append(f"- **Project Review Statuses**: {summary['review_status_counts']}{ratio_part}")
     if summary["trigger_counts"]:
         lines.append(f"- **Review Triggers**: {summary['trigger_counts']}")

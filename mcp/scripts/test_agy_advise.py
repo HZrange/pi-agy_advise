@@ -2296,7 +2296,7 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
             stage_base.mkdir()
             advisor = Advisor(str(fake_cli), str(stage_base))
             try:
-                # 1. Project directive (single_turn + schema + readonly_files) stages, audits read/denied, & cleans up!
+                # 1. Small readonly_files use smart inline mode (zero-tool 1-turn, line numbers embedded, clean advice!)
                 await execute_advise(
                     store=self.store,
                     advisor=advisor,
@@ -2305,7 +2305,7 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
                         score_name="s", baseline_score=2, pass_score=6, route="r0",
                     ),
                 )
-                d_res = await execute_advise(
+                d_inline = await execute_advise(
                     store=self.store,
                     advisor=advisor,
                     readonly_files=[str(code_file), str(eval_file)],
@@ -2314,31 +2314,57 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
                         phase="p1",
                         action="directive",
                         directive="Train 100k more steps under existing braking gate.",
-                        route="r1-more-steps",
+                        route="r1-inline",
+                    ),
+                )
+                self.assertEqual(d_inline["review_status"], "decided")
+                self.assertTrue(d_inline["dissent_raised"])
+                self.assertEqual(d_inline["readonly_grounding_mode"], "inline")
+                self.assertEqual(d_inline["readonly_files_staged"], ["braking_gate.py", "eval_summary.json"])
+                self.assertEqual(d_inline["readonly_files_read"], ["braking_gate.py", "eval_summary.json"])
+                self.assertEqual(d_inline["readonly_denied_calls"], [])
+                # Zero-tool mode keeps read_file(*) denied and creates zero staging dirs
+                self.assertIn("hooks=False no_read_deny=False write_denied=True files=0", d_inline["project"]["last_decision"]["why"])
+                self.assertEqual(list(stage_base.glob("ro-*")), [])
+
+                # 2. Large file (>24KB) falls back to staged_hook mode, audits read/denied, & cleans up!
+                big_code = tmp_p / "large_controller.py"
+                big_code.write_text("# pad\n" * 4500 + "MAX_VX_ERR = 0.42543\n", encoding="utf-8")
+                d_res = await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    readonly_files=[str(big_code), str(eval_file)],
+                    project=Directive(
+                        id="roproj",
+                        phase="p1",
+                        action="directive",
+                        directive="Audit large controller file.",
+                        route="r2-staged",
                     ),
                 )
                 self.assertEqual(d_res["review_status"], "decided")
                 self.assertTrue(d_res["dissent_raised"])
-                self.assertEqual(d_res["readonly_files_staged"], ["braking_gate.py", "eval_summary.json"])
-                self.assertEqual(d_res["readonly_files_read"], ["braking_gate.py"])
+                self.assertEqual(d_res["readonly_grounding_mode"], "staged_hook")
+                self.assertEqual(d_res["readonly_files_staged"], ["large_controller.py", "eval_summary.json"])
+                self.assertEqual(d_res["readonly_files_read"], ["large_controller.py"])
                 self.assertEqual(len(d_res["readonly_denied_calls"]), 1)
                 self.assertIn("hooks=True no_read_deny=True write_denied=True files=2", d_res["project"]["last_decision"]["why"])
                 # Single-turn staging workspace MUST be cleaned up immediately!
                 self.assertEqual(list(stage_base.glob("ro-*")), [])
 
-                # 2. Multi-turn Q&A with readonly_files retains staging dir across follow-ups & blocks changing whitelist
+                # 3. Multi-turn Q&A with staged_hook retains staging dir across follow-ups & blocks changing whitelist
                 qa1 = await execute_advise(
                     store=self.store,
                     advisor=advisor,
-                    question="Check braking_gate.py for feasibility.",
-                    readonly_files=[str(code_file)],
+                    question="Check large_controller.py for feasibility.",
+                    readonly_files=[str(big_code)],
                 )
                 self.assertIn("hooks=True files=1 has_manifest=True", qa1["advice"])
                 self.assertEqual(len(list(stage_base.glob("ro-*"))), 1)
                 qa2 = await execute_advise(
                     store=self.store,
                     advisor=advisor,
-                    question="Follow-up on line 1.",
+                    question="Follow-up on line 4501.",
                     session_id=qa1["session_id"],
                 )
                 self.assertIn("turn=2 hooks=True files=1", qa2["advice"])
@@ -2351,19 +2377,103 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
                         readonly_files=[str(eval_file)],
                     )
 
-                # 3. Telemetry summarizes readonly_grounding accurately
+                # 4. Telemetry summarizes inline vs staged_hook readonly_grounding accurately
                 summary = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path)
                 rg = summary["readonly_grounding"]
-                self.assertEqual(rg["grounded_calls"], 3)
-                self.assertEqual(rg["files_staged"], 4)
-                self.assertEqual(rg["files_read"], 3)
+                self.assertEqual(rg["grounded_calls"], 4)
+                self.assertEqual(rg["inline_calls"], 1)
+                self.assertEqual(rg["staged_hook_calls"], 3)
+                self.assertEqual(rg["files_staged"], 6)
+                self.assertEqual(rg["files_read"], 5)
                 self.assertEqual(rg["denied_tool_attempts"], 1)
                 md = format_summary(summary)
                 self.assertIn("Read-Only Grounding", md)
+                self.assertIn("inline=1, staged_hook=3", md)
             finally:
                 await advisor.stop()
                 advisor.cleanup_workspaces()
                 self.assertEqual(list(stage_base.glob("ro-*")), [])
+
+    async def test_directive_churn_and_caution_creep_auto_escalate_to_dissent(self):
+        init_evt = Initialize(
+            id="creep",
+            phase="p1",
+            action="init",
+            objective="Pass 6/8",
+            frozen_gate="Dynamic >= 6/8",
+            score_name="dyn",
+            baseline_score=2,
+            pass_score=6,
+            proxy_limit=3,
+            route="r0",
+        )
+        soft_caution = lambda tag: json.dumps(
+            {
+                "alignment": "caution",
+                "verdict_summary": f"Caution on {tag}, but spinning risk is high.",
+                "root_cause_class": "optimization_mismatch",
+                "dissent_points": [f"Repeated route switch {tag} without any frozen gate eval."],
+                "fatal_assumptions": ["Proxy metric reflects frozen gate"],
+                "cheapest_falsifier": "Run 1 direct frozen gate eval",
+                "alternative_path": "Suspend phase and fork clean ledger",
+                "recommended_guardrails": ["Hard budget cap"],
+            }
+        )
+        advisor = FakeAdvisor([soft_caution("d1"), soft_caution("d2"), soft_caution("d3")])
+        await execute_advise(store=self.store, advisor=advisor, project=init_evt)
+
+        # Accumulate 3 proxy/diagnostic trials so global_proxy_drift is active
+        for idx in range(3):
+            await execute_advise(
+                store=self.store,
+                advisor=advisor,
+                project=Report(
+                    id="creep", phase="p1", action="report", trial_id=f"p{idx}", route="r0",
+                    cycle=0, mechanism=f"m{idx}", evidence_kind="diagnostic", evidence="diag", auto_review=False,
+                ),
+            )
+
+        # Directives 1 & 2 (directives_since_last_gate = 0 then 1): still auto-activate on caution
+        r1 = await execute_advise(
+            store=self.store, advisor=advisor,
+            project=Directive(id="creep", phase="p1", action="directive", directive="Switch 1", route="r1"),
+        )
+        self.assertEqual(r1["directive_alignment"], "caution")
+        self.assertTrue(r1["caution_with_dissent_points"])
+        self.assertFalse(r1["auto_escalated_dissent"])
+        self.assertTrue(r1["project"]["dispatch_allowed"])
+
+        r2 = await execute_advise(
+            store=self.store, advisor=advisor,
+            project=Directive(id="creep", phase="p1", action="directive", directive="Switch 2", route="r2"),
+        )
+        self.assertEqual(r2["directive_alignment"], "caution")
+        self.assertTrue(r2["project"]["dispatch_allowed"])
+
+        # Directive 3 (directives_since_last_gate == 2 + global_proxy_drift + dissent_points):
+        # Anti-caution-creep backstop MUST auto-escalate to DISSENT and pause dispatch!
+        r3 = await execute_advise(
+            store=self.store, advisor=advisor,
+            project=Directive(id="creep", phase="p1", action="directive", directive="Switch 3 uncapped", route="r3"),
+        )
+        self.assertIn("DIRECTIVE-CHURN / SPINNING ALERT", advisor.calls[2]["prompt"])
+        self.assertEqual(r3["directive_alignment"], "dissent")
+        self.assertTrue(r3["dissent_raised"])
+        self.assertTrue(r3["auto_escalated_dissent"])
+        self.assertTrue(r3["caution_with_dissent_points"])
+        self.assertFalse(r3["project"]["dispatch_allowed"])
+        self.assertIn("advisor_dissent", r3["project"]["review_reasons"])
+        self.assertIn("directive_churn", r3["project"]["efficiency"]["macro_alerts"])
+
+        # Telemetry cleanly separates review/report vs directive/report and tracks soft_dissent/escalations
+        summary = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path)
+        self.assertEqual(summary["governance_efficiency"]["review_to_report_ratio"], 0.0)
+        self.assertEqual(summary["governance_efficiency"]["directive_to_report_ratio"], 1.0)
+        self.assertEqual(summary["directives"]["caution_with_dissent_points"], 3)
+        self.assertEqual(summary["directives"]["auto_escalated_dissent"], 1)
+        md = format_summary(summary)
+        self.assertIn("directive/report=1.00", md)
+        self.assertIn("auto_escalated=1", md)
 
     def test_child_env_strips_ssh_markers_when_dbus_socket_exists(self):
         with tempfile.TemporaryDirectory() as tmp:

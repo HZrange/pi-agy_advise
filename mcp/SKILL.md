@@ -7,7 +7,7 @@ description: 用本机 Codex 的 agy_advise MCP 工具向 Google Antigravity 请
 
 通过本机注册的 `agy_advise` MCP 工具，让 Google Antigravity 担任**独立的第一性原理决策辅助者与全局技术总指挥**：它的核心职责不是走流程盖章，而是**挑战前提、识别真实根因类别、揭露局部最优与代理指标陷阱，并在必要时通过白名单只读文件直接核验一手代码与评测 JSON**。
 
-默认在零工具临时目录沙箱运行；当显式传入 `readonly_files` 白名单时，仅将白名单内的非敏感文本/代码/JSON 复制为 `0o444` 只读快照放入隔离临时目录，并由 `--settings` 禁止写/执行/联网与 `PreToolUse` 白名单钩子双重硬拦截——严禁修改文件、执行命令、联网或读取白名单之外的任何路径。
+默认在零工具临时目录沙箱运行；当显式传入 `readonly_files` 白名单时，全部文件先经本地敏感/二进制/大小预校验：小体量文本（单文件 ≤24KB 且总量 ≤36KB）自动带行号内联进只读证据块（单回合零工具往返，延迟立降 50%+）；更大文件自动复制为 `0o444` 只读快照放入隔离临时目录，由 `--settings` 禁止写/执行/联网与 `PreToolUse` 白名单钩子双重硬拦截——严禁修改文件、执行命令、联网或读取白名单之外的任何路径。
 
 本 Skill 提供两层协同能力：
 1. **全局问答模式（默认，零配置适用任意项目）**：单次提问或短追问，先质疑前提与局部最优、区分四类根因（实现 bug / 数据覆盖 / 优化失配 / 约束或容量上限），再给出高杠杆行动与最便宜证伪测试。
@@ -62,7 +62,7 @@ description: 用本机 Codex 的 agy_advise MCP 工具向 Google Antigravity 请
 ### 核心护栏与闭环进化机制
 
 - **第一性原理四类根因判别**：复盘与方向预验尸均要求先明确区分 `implementation_bug`（修代码）、`data_coverage`（补态/补示范）、`optimization_mismatch`（改目标/算法）与 `constraint_or_capacity`（硬约束或容量上限冲突），杜绝把代码 bug 或约束矛盾误当成“继续加训练步数”。
-- **反空转与反 HOLD-churn**：包含单周期 `stagnation` / `same_mechanism_spin` / `proxy_drift`，跨周期 `macro_stagnation` / `pivot_churn` / `global_proxy_drift`（已修复误杀新 `PIVOT` 多步跑道首试的缺陷），以及 **`hold_churn`**（连续 ≥3 次 HOLD 强制退出或 `suspend`）与 **`qualitative_numeric_mismatch`**。
+- **反空转、反 HOLD-churn 与反软异议逃逸**：除单周期与跨周期护栏外，内置 **`hold_churn`**（连续 ≥3 次 HOLD）、**`directive_churn`**（连续 ≥3 次 `directive` 换路且 0 真实门禁）与 **`qualitative_numeric_mismatch`**；当项目已陷入空转且顾问在 `directive` 中写出了实质 `dissent_points` 却客气地标了 `caution` 时，代码层会自动升级为 **`DISSENT`** 并暂停派发（`auto_escalated_dissent=true`），杜绝“软异议悄悄放行”。
 - **真正让 `max_trials=2..5` 跑起来**：在多步跑道内，第 1 条探索/可行性诊断不会被旧路线的 `global_proxy_drift` 或 `macro_stagnation` 提前腰斩；配合 `regression_severity="soft"`，实质路线可完整跑完探索跑道再统一复盘。
 - **自动结果归因（Outcome Attribution）**：每轮周期结束时自动比对真分变化与跑道利用率，沉淀到 `project.track_record`；对“总指挥 `dissent` 后人类强行覆盖”的路线，自动判定 **`dissent_vindicated`（异议被证成）** 或 **`dissent_refuted`（异议被推翻）**。
 

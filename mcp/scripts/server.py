@@ -31,6 +31,8 @@ Stance = Literal["global", "red_team", "tactical"]
 MAX_READONLY_FILES = 12
 MAX_READONLY_FILE_BYTES = 512 * 1024
 MAX_READONLY_TOTAL_BYTES = 2 * 1024 * 1024
+INLINE_READONLY_MAX_FILE_BYTES = 24 * 1024
+INLINE_READONLY_MAX_TOTAL_BYTES = 36 * 1024
 
 _SENSITIVE_DIR_NAMES = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker"})
 _SENSITIVE_EXACT_NAMES = frozenset(
@@ -143,7 +145,8 @@ class StagedReadonlyWorkspace:
                 f"- `{item.staged_path}` (source: `{item.source_name}`, {item.line_count} lines, {kb} KB, sha256={item.sha256})"
             )
         lines.append(
-            "Use `read_file` on these exact staged paths to verify key code/JSON facts directly before concluding; cite `filename:line` or JSON keys."
+            "Efficiency & safety rules: batch ALL needed `read_file` calls in a SINGLE parallel turn; do NOT read "
+            "`MANIFEST.json` and do NOT emit long intermediate narration before your final answer. Cite exact `filename:line` or JSON keys."
         )
         return "\n".join(lines)
 
@@ -238,6 +241,55 @@ def validate_readonly_files(readonly_files: list[str] | None) -> list[Path]:
         resolved_list.append(resolved)
 
     return resolved_list
+
+
+def _inline_readonly_enabled() -> bool:
+    return os.getenv("AGY_ADVISE_INLINE_READONLY", "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+def try_build_inline_readonly_bundle(resolved_files: list[Path]) -> tuple[str, list[str], int] | None:
+    """Inline small whitelisted UTF-8 files with 1-based line numbers to eliminate multi-turn read_file latency.
+
+    Returns (prompt_block, file_names, total_bytes) when eligible, or None to fall back to staged_hook mode.
+    """
+    if not resolved_files or not _inline_readonly_enabled():
+        return None
+    total_bytes = 0
+    payloads: list[tuple[Path, bytes, str]] = []
+    for src in resolved_files:
+        try:
+            raw = src.read_bytes()
+        except OSError:
+            return None
+        if len(raw) > INLINE_READONLY_MAX_FILE_BYTES:
+            return None
+        total_bytes += len(raw)
+        if total_bytes > INLINE_READONLY_MAX_TOTAL_BYTES:
+            return None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        payloads.append((src, raw, text))
+
+    sections = [
+        "Whitelisted Read-Only Evidence Files (INLINED DIRECTLY with 1-based line numbers; zero tool calls needed — verify directly and cite `filename:line` or JSON keys):"
+    ]
+    names: list[str] = []
+    for idx, (src, raw, text) in enumerate(payloads, 1):
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", src.name) or f"file_{idx}"
+        label = f"{idx:02d}_{safe_name}"
+        sha = hashlib.sha256(raw).hexdigest()[:12]
+        lines = text.splitlines()
+        kb = round(len(raw) / 1024.0, 1)
+        numbered = "\n".join(f"{line_no}: {line}" for line_no, line in enumerate(lines, 1))
+        sections.append(
+            f"=== FILE: {label} (source: {src.name}, {len(lines)} lines, {kb} KB, sha256={sha}) ===\n"
+            f"{numbered}\n"
+            f"=== END FILE: {label} ==="
+        )
+        names.append(src.name)
+    return "\n\n".join(sections), names, total_bytes
 
 
 def prepare_readonly_workspace(base_dir: str | Path, resolved_files: list[Path]) -> StagedReadonlyWorkspace:
@@ -430,9 +482,10 @@ def build_advice_prompt(
         )
     elif has_readonly_files:
         sections.append(
-            "Ground your judgment in the material supplied below AND the whitelisted read-only files staged in "
-            "`readonly_evidence/`. Actively use `read_file` to verify key code/JSON facts before concluding — "
-            "never trust a summary over the actual file, and cite exact `filename:line` or JSON keys."
+            "Ground your judgment in the material supplied below AND the whitelisted read-only files attached at the "
+            "bottom (either inlined with 1-based line numbers or staged in `readonly_evidence/`). Verify key code/JSON "
+            "facts directly before concluding — never trust a summary over the actual file, and cite exact `filename:line` "
+            "or JSON keys. If files are staged for `read_file`, batch all reads in one parallel turn without reading `MANIFEST.json`."
         )
     else:
         sections.append(
@@ -753,9 +806,12 @@ class Advisor:
                 raise self.failure("Antigravity reported a failed turn.", result.get("error"))
 
             structured = result.get("structured_output")
-            advice = result.get("response")
-            if (not isinstance(advice, str) or not advice.strip()) and isinstance(structured, dict):
+            raw_response = result.get("response")
+            raw_response_str = raw_response.strip() if isinstance(raw_response, str) else ""
+            if isinstance(structured, dict):
                 advice = json.dumps(structured, ensure_ascii=False)
+            else:
+                advice = raw_response_str
             if not isinstance(advice, str) or not advice.strip():
                 raise self.failure("Antigravity returned no advice. Try a self-contained text question.")
             if session_id not in self.conversations:
@@ -764,6 +820,7 @@ class Advisor:
             reported_model = result.get("model") or event.get("model") or init_model
             reply: dict[str, object] = {
                 "advice": advice.strip(),
+                "raw_response_chars": len(raw_response_str) if raw_response_str else len(advice.strip()),
                 "session_id": session_id,
                 "duration_seconds": result.get("duration_seconds"),
                 "usage": result.get("usage"),
@@ -772,6 +829,7 @@ class Advisor:
             if isinstance(structured, dict):
                 reply["structured_output"] = structured
             if workspace is not None:
+                reply["readonly_grounding_mode"] = "staged_hook"
                 reply["readonly_files_staged"] = [item.source_name for item in workspace.files]
                 reply["readonly_files_bytes"] = workspace.total_bytes
                 reply["readonly_files_read"] = files_read
@@ -809,6 +867,7 @@ class Advisor:
                 raise RuntimeError(queue_timeout)
 
             workspace: StagedReadonlyWorkspace | None = None
+            inline_bundle: tuple[str, list[str], int] | None = None
             if session_id is not None:
                 if session_id not in self.conversations:
                     raise ValueError("Unknown advisor session. Omit session_id to start a new conversation.")
@@ -829,11 +888,15 @@ class Advisor:
             else:
                 model = model or os.getenv("AGY_ADVISE_MODEL") or None
                 if resolved_ro:
-                    workspace = prepare_readonly_workspace(self.directory, resolved_ro)
-                    ephemeral_workspace = workspace
+                    inline_bundle = try_build_inline_readonly_bundle(resolved_ro)
+                    if inline_bundle is None:
+                        workspace = prepare_readonly_workspace(self.directory, resolved_ro)
+                        ephemeral_workspace = workspace
 
             effective_prompt = prompt
-            if workspace is not None and session_id is None:
+            if inline_bundle is not None and session_id is None:
+                effective_prompt = f"{prompt}\n\n{inline_bundle[0]}"
+            elif workspace is not None and session_id is None:
                 effective_prompt = f"{prompt}\n\n{workspace.format_prompt_block()}"
 
             use_schema = (
@@ -888,6 +951,14 @@ class Advisor:
                         self.session_workspaces[key] = ephemeral_workspace
                         ephemeral_workspace = None
                 self.idle = asyncio.create_task(self.expire())
+
+            if inline_bundle is not None:
+                _, inline_names, inline_bytes = inline_bundle
+                reply["readonly_grounding_mode"] = "inline"
+                reply["readonly_files_staged"] = inline_names
+                reply["readonly_files_bytes"] = inline_bytes
+                reply["readonly_files_read"] = list(inline_names)
+                reply["readonly_denied_calls"] = []
 
             configured_model = model or _read_cli_default_model()
             reply.update(
