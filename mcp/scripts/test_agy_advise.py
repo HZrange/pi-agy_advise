@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -47,11 +48,23 @@ from project import (  # noqa: E402
     decode_decision,
     decode_directive_review,
     handle_project,
+    is_direction_change_directive,
     public,
     render_markdown_summary,
     review_prompt,
 )
-from server import Advisor, build_advice_prompt, execute_advise, server  # noqa: E402
+from server import (  # noqa: E402
+    Advisor,
+    MAX_READONLY_FILES,
+    MAX_READONLY_FILE_BYTES,
+    READONLY_SESSION_SETTINGS,
+    _build_child_env,
+    build_advice_prompt,
+    execute_advise,
+    prepare_readonly_workspace,
+    server,
+    validate_readonly_files,
+)
 from telemetry import format_summary, read_jsonl, record_feedback, summarize_logs  # noqa: E402
 import audit_report  # noqa: E402
 
@@ -61,7 +74,16 @@ class FakeAdvisor:
         self.responses = list(responses)
         self.calls = []
 
-    async def ask(self, prompt, session_id, timeout, effort=None, model=None, json_schema=None):
+    async def ask(
+        self,
+        prompt,
+        session_id,
+        timeout,
+        effort=None,
+        model=None,
+        json_schema=None,
+        readonly_files=None,
+    ):
         self.calls.append(
             {
                 "prompt": prompt,
@@ -70,6 +92,7 @@ class FakeAdvisor:
                 "effort": effort,
                 "model": model,
                 "json_schema": json_schema,
+                "readonly_files": readonly_files,
             }
         )
         outcome = self.responses.pop(0)
@@ -1820,6 +1843,561 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
                 self.assertEqual(rc, 0)
             finally:
                 await advisor.stop()
+
+    async def test_mandatory_red_team_check_on_direction_change_and_budget_only_sync(self):
+        init_evt = Initialize(
+            id="dirguard",
+            phase="p1",
+            action="init",
+            objective="Reach 6/8",
+            frozen_gate="Dynamic >= 6/8",
+            budget_envelope={"train_steps": 10000},
+            score_name="dyn",
+            baseline_score=2,
+            pass_score=6,
+            route="r0",
+        )
+        red_team_reply = json.dumps(
+            {
+                "alignment": "caution",
+                "verdict_summary": "DAgger direction is sound if teacher takeover rate >= 75%.",
+                "root_cause_class": "data_coverage",
+                "dissent_points": [],
+                "fatal_assumptions": ["Teacher can recover from student OOD states"],
+                "cheapest_falsifier": "Run 10-seed teacher takeover pilot before scaling",
+                "recommended_guardrails": ["Stop if takeover < 75%"],
+                "evidence_citations": ["train.py:42"],
+                "suggested_max_trials": 3,
+            }
+        )
+        advisor = FakeAdvisor([red_team_reply])
+        await execute_advise(store=self.store, advisor=advisor, project=init_evt)
+
+        # Trying to skip red-team check on a route/direction change MUST be rejected in code!
+        with self.assertRaises(ValueError):
+            await execute_advise(
+                store=self.store,
+                advisor=advisor,
+                project=Directive(
+                    id="dirguard",
+                    phase="p1",
+                    action="directive",
+                    directive="Switch to DAgger immediately.",
+                    route="dagger-v1",
+                    run_advisor_check=False,
+                ),
+            )
+        # Trying to skip red-team check on unblock=True (even with budget) MUST be rejected!
+        with self.assertRaises(ValueError):
+            await execute_advise(
+                store=self.store,
+                advisor=advisor,
+                project=Directive(
+                    id="dirguard",
+                    phase="p1",
+                    action="directive",
+                    directive="Add 20k budget and unblock.",
+                    budget_envelope={"train_steps": 30000},
+                    unblock=True,
+                    run_advisor_check=False,
+                ),
+            )
+        # Explicit direction_change=True with run_advisor_check=False MUST also be rejected!
+        with self.assertRaises(ValueError):
+            await execute_advise(
+                store=self.store,
+                advisor=advisor,
+                project=Directive(
+                    id="dirguard",
+                    phase="p1",
+                    action="directive",
+                    directive="Adjust strategy scope.",
+                    budget_envelope={"train_steps": 30000},
+                    direction_change=True,
+                    unblock=False,
+                    run_advisor_check=False,
+                ),
+            )
+        self.assertEqual(len(advisor.calls), 0)
+
+        # Pure administrative budget sync (budget_envelope + unblock=False + no route/family change) MAY skip LLM.
+        sync_res = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Directive(
+                id="dirguard",
+                phase="p1",
+                action="directive",
+                directive="Sync human-approved budget increase to 30k.",
+                budget_envelope={"train_steps": 30000},
+                budget_note="Owner re-authorized 30k train steps.",
+                unblock=False,
+                run_advisor_check=False,
+            ),
+        )
+        self.assertEqual(sync_res["review_status"], "not_called")
+        self.assertEqual(sync_res["project"]["budget_envelope"]["train_steps"], 30000)
+        self.assertEqual(len(advisor.calls), 0)
+
+        # Direction change with mandatory short red-team check succeeds, records root_cause_class & citations.
+        dir_res = await execute_advise(
+            store=self.store,
+            advisor=advisor,
+            project=Directive(
+                id="dirguard",
+                phase="p1",
+                action="directive",
+                directive="Pivot to student-rollout expert-takeover DAgger.",
+                route="dagger-v1",
+                hypothesis_family="closed-loop-dagger",
+                max_trials=3,
+            ),
+        )
+        self.assertEqual(dir_res["review_status"], "decided")
+        self.assertTrue(dir_res["is_direction_change"])
+        self.assertEqual(dir_res["directive_alignment"], "caution")
+        self.assertEqual(dir_res["project"]["last_decision"]["root_cause_class"], "data_coverage")
+        self.assertEqual(dir_res["project"]["last_decision"]["evidence_citations"], ["train.py:42"])
+        self.assertTrue(dir_res["project"]["dispatch_allowed"])
+        self.assertIn("SHORT PRE-MORTEM", advisor.calls[0]["prompt"])
+
+        summary = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path)
+        self.assertEqual(summary["directives"]["direction_changes"], 1)
+
+    async def test_global_proxy_drift_does_not_ambush_trial_1_of_fresh_multi_trial_pivot(self):
+        init_evt = Initialize(
+            id="l305fix",
+            phase="p1",
+            action="init",
+            objective="Pass 6/8",
+            frozen_gate="Dynamic >= 6/8",
+            score_name="dyn",
+            baseline_score=2,
+            pass_score=6,
+            proxy_limit=3,
+            stagnation_limit=5,
+            route="old-r0",
+        )
+        await handle_project(self.store, init_evt, FakeAdvisor([]), self.inv, "", None, 60, None, None)
+
+        # Accumulate 6 proxy trials (>= 2 * proxy_limit) before pivoting.
+        for idx in range(6):
+            await handle_project(
+                self.store,
+                Report(
+                    id="l305fix",
+                    phase="p1",
+                    action="report",
+                    trial_id=f"old-p{idx}",
+                    route="old-r0",
+                    cycle=0,
+                    mechanism=f"m{idx}",
+                    evidence_kind="diagnostic",
+                    evidence="Prior diagnostic.",
+                    auto_review=False,
+                ),
+                FakeAdvisor([]),
+                self.inv,
+                "",
+                None,
+                60,
+                None,
+                None,
+            )
+
+        pivot_reply = json.dumps(
+            {
+                "decision": "PIVOT",
+                "why": "Switch to fresh unified braking-recovery route with 3-trial runway.",
+                "main_bottleneck": "Braking stability",
+                "root_cause_class": "optimization_mismatch",
+                "contrarian_check": "If braking fails on native expert too, constraint may be infeasible.",
+                "hypothesis_family": "unified-control",
+                "route": "fresh-r1",
+                "next_trial": "Run 1 pilot diagnostic then train + gate eval",
+                "expected_signal": "Gate >= 4/8",
+                "stop_condition": "Pilot fails takeover",
+                "max_trials": 3,
+            }
+        )
+        rev = await handle_project(
+            self.store,
+            Review(id="l305fix", phase="p1", action="review"),
+            FakeAdvisor([pivot_reply]),
+            self.inv,
+            "",
+            None,
+            60,
+            None,
+            None,
+        )
+        await handle_project(
+            self.store,
+            Activate(id="l305fix", phase="p1", action="activate", decision_id=rev["project"]["last_decision"]["id"]),
+            FakeAdvisor([]),
+            self.inv,
+            "",
+            None,
+            60,
+            None,
+            None,
+        )
+
+        # Trial 1 of fresh 3-trial runway: diagnostic probe MUST NOT be ambushed by global_proxy_drift!
+        t1 = await handle_project(
+            self.store,
+            Report(
+                id="l305fix",
+                phase="p1",
+                action="report",
+                trial_id="fresh-t1",
+                route="fresh-r1",
+                cycle=1,
+                mechanism="pilot-probe",
+                evidence_kind="diagnostic",
+                outcome="progress",
+                evidence="Pilot probe succeeded; proceeding to student run.",
+            ),
+            FakeAdvisor([]),
+            self.inv,
+            "",
+            None,
+            60,
+            None,
+            None,
+        )
+        self.assertTrue(t1["project"]["dispatch_allowed"])
+        self.assertEqual(t1["review_status"], "not_called")
+        self.assertNotIn("global_proxy_drift", t1["project"]["review_reasons"])
+
+        # Trial 2 still proxy/diagnostic (no real gate yet): NOW global_proxy_drift MUST fire!
+        t2 = await handle_project(
+            self.store,
+            Report(
+                id="l305fix",
+                phase="p1",
+                action="report",
+                trial_id="fresh-t2",
+                route="fresh-r1",
+                cycle=1,
+                mechanism="pilot-probe-2",
+                evidence_kind="diagnostic",
+                outcome="progress",
+                evidence="Another diagnostic without real gate.",
+                auto_review=False,
+            ),
+            FakeAdvisor([]),
+            self.inv,
+            "",
+            None,
+            60,
+            None,
+            None,
+        )
+        self.assertFalse(t2["project"]["dispatch_allowed"])
+        self.assertIn("global_proxy_drift", t2["project"]["review_reasons"])
+
+    def test_readonly_files_validation_blocks_secrets_binaries_dirs_and_oversized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good_py = root / "reward.py"
+            good_py.write_text("def reward(v): return -abs(v)\n", encoding="utf-8")
+            good_json = root / "eval_report.json"
+            good_json.write_text('{"dynamic_pass": 3}\n', encoding="utf-8")
+
+            # Valid files accepted & deduped
+            validated = validate_readonly_files([str(good_py), str(good_json), str(good_py)])
+            self.assertEqual(validated, [good_py.resolve(), good_json.resolve()])
+
+            # Missing file rejected
+            with self.assertRaises(ValueError):
+                validate_readonly_files([str(root / "missing.py")])
+
+            # Directory rejected
+            sub = root / "subdir"
+            sub.mkdir()
+            with self.assertRaises(ValueError):
+                validate_readonly_files([str(sub)])
+
+            # Binary file rejected
+            bin_file = root / "weights.bin"
+            bin_file.write_bytes(b"\x00\x01\x02BINARY")
+            with self.assertRaises(ValueError):
+                validate_readonly_files([str(bin_file)])
+
+            # Oversized file rejected
+            big_file = root / "huge.log"
+            big_file.write_bytes(b"a" * (MAX_READONLY_FILE_BYTES + 1))
+            with self.assertRaises(ValueError):
+                validate_readonly_files([str(big_file)])
+
+            # Too many files rejected
+            many = []
+            for idx in range(MAX_READONLY_FILES + 1):
+                p = root / f"f{idx}.txt"
+                p.write_text("ok\n", encoding="utf-8")
+                many.append(str(p))
+            with self.assertRaises(ValueError):
+                validate_readonly_files(many)
+
+            # Sensitive / credential files rejected
+            for bad_name in (".env", ".env.prod", "auth.json", "service_secret.json", "priv.pem", "id_rsa", "projects.sqlite3"):
+                bad_path = root / bad_name
+                bad_path.write_text("sensitive\n", encoding="utf-8")
+                with self.assertRaises(ValueError, msg=f"Should reject {bad_name}"):
+                    validate_readonly_files([str(bad_path)])
+            ssh_dir = root / ".ssh"
+            ssh_dir.mkdir()
+            ssh_cfg = ssh_dir / "config"
+            ssh_cfg.write_text("Host *\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                validate_readonly_files([str(ssh_cfg)])
+
+    def test_readonly_pretooluse_hook_strictly_enforces_whitelist_and_denies_other_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_py = root / "controller.py"
+            src_py.write_text("STEP_LIMIT = 50\n", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("do not read\n", encoding="utf-8")
+
+            ws = prepare_readonly_workspace(root / "stage_base", [src_py.resolve()])
+            try:
+                guard = ws.root / ".agents" / "readonly_guard.py"
+                hooks_json = json.loads((ws.root / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+                self.assertIn("readonly-whitelist", hooks_json)
+
+                def run_guard(payload: str) -> dict:
+                    proc = subprocess.run(
+                        [sys.executable, str(guard)],
+                        input=payload,
+                        text=True,
+                        capture_output=True,
+                        check=True,
+                    )
+                    return json.loads(proc.stdout)
+
+                # 1. Exact staged file allowed
+                staged = ws.files[0].staged_path
+                r_ok = run_guard(json.dumps({"toolCall": {"name": "read_file", "args": {"Path": staged}}, "cwd": str(ws.root)}))
+                self.assertEqual(r_ok["decision"], "allow")
+
+                # 2. Relative staged path allowed
+                r_rel = run_guard(json.dumps({"toolCall": {"name": "view_file", "args": {"path": ws.files[0].staged_rel}}, "cwd": str(ws.root)}))
+                self.assertEqual(r_rel["decision"], "allow")
+
+                # 3. MANIFEST.json allowed
+                r_man = run_guard(json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(ws.manifest_path)}}, "cwd": str(ws.root)}))
+                self.assertEqual(r_man["decision"], "allow")
+
+                # 4. Outside file & original source path & path traversal ALL DENIED
+                for bad_path in (str(outside), str(src_py), "/etc/hostname", "../.agents/readonly_guard.py", str(guard)):
+                    res = run_guard(json.dumps({"toolCall": {"name": "read_file", "args": {"Path": bad_path}}, "cwd": str(ws.root)}))
+                    self.assertEqual(res["decision"], "deny", msg=f"Should deny {bad_path}")
+
+                # 5. All non-read tools DENIED
+                for tool_name in ("write_file", "edit_file", "run_command", "search_web", "list_dir", "grep_search", "call_mcp_tool"):
+                    res = run_guard(json.dumps({"toolCall": {"name": tool_name, "args": {"Path": staged}}, "cwd": str(ws.root)}))
+                    self.assertEqual(res["decision"], "deny", msg=f"Should deny tool {tool_name}")
+
+                # 6. Malformed input fails closed
+                res_bad = run_guard("not-json{")
+                self.assertEqual(res_bad["decision"], "deny")
+            finally:
+                ws.cleanup()
+                self.assertFalse(ws.root.exists())
+
+    async def test_readonly_grounding_end_to_end_cleanup_qa_followup_and_telemetry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            code_file = tmp_p / "braking_gate.py"
+            code_file.write_text("MAX_VX_ERR = 0.42543\n", encoding="utf-8")
+            eval_file = tmp_p / "eval_summary.json"
+            eval_file.write_text('{"expert_pass": 3, "student_pass": 4}\n', encoding="utf-8")
+
+            fake_cli = tmp_p / "fake_agy_ro.py"
+            fake_cli.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json, os, sys
+                    from pathlib import Path
+
+                    settings_idx = sys.argv.index("--settings") + 1
+                    settings = json.loads(sys.argv[settings_idx])
+                    deny = settings.get("permissions", {}).get("deny", [])
+                    has_schema = "--json-schema" in sys.argv
+                    cwd = Path(os.getcwd())
+                    ev_dir = cwd / "readonly_evidence"
+                    hooks_ok = (cwd / ".agents" / "hooks.json").is_file()
+                    staged = sorted(p for p in ev_dir.iterdir() if p.name != "MANIFEST.json") if ev_dir.is_dir() else []
+
+                    print(json.dumps({"event": "init", "conversation_id": "conv-ro", "init": {"model": "gemini-4-neon-xhigh"}}), flush=True)
+                    turn = 0
+                    for line in sys.stdin:
+                        turn += 1
+                        msg = json.loads(line)["message"]["content"]
+                        # Emit realistic step_update tool events for read_file + a blocked write attempt
+                        if staged:
+                            print(json.dumps({
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "tool",
+                                    "state": "DONE",
+                                    "tool_name": "read_file",
+                                    "tool_info": {"parameters": {"Path": str(staged[0])}, "output": "1 lines"},
+                                },
+                            }), flush=True)
+                            if turn == 1 and has_schema:
+                                print(json.dumps({
+                                    "event": "step_update",
+                                    "step_update": {
+                                        "step_type": "tool",
+                                        "state": "ERROR",
+                                        "tool_name": "write_file",
+                                        "tool_info": {"error": {"message": "Permission denied by deny rule"}},
+                                    },
+                                }), flush=True)
+
+                        if has_schema:
+                            payload = {
+                                "alignment": "dissent",
+                                "verdict_summary": f"hooks={hooks_ok} no_read_deny={'read_file(*)' not in deny} write_denied={'write_file(*)' in deny} files={len(staged)}",
+                                "root_cause_class": "constraint_or_capacity",
+                                "dissent_points": ["braking_gate.py:1 shows MAX_VX_ERR=0.42543 blocks instant stop."],
+                                "fatal_assumptions": ["Student can beat expert under identical speed gate"],
+                                "cheapest_falsifier": "Verify physics braking bound from braking_gate.py:1",
+                                "alternative_path": "Pre-deceleration ramp or constraint renegotiation",
+                                "evidence_citations": ["braking_gate.py:1", "eval_summary.json:expert_pass=3"],
+                            }
+                            resp_text = json.dumps(payload)
+                            structured = payload
+                        else:
+                            resp_text = f"turn={turn} hooks={hooks_ok} files={len(staged)} has_manifest={'readonly_evidence' in msg}"
+                            structured = None
+
+                        res_obj = {
+                            "status": "SUCCESS",
+                            "conversation_id": "conv-ro",
+                            "response": resp_text,
+                            "duration_seconds": 0.3,
+                            "usage": {"total_tokens": 120, "cache_read_tokens": 40},
+                        }
+                        if structured is not None:
+                            res_obj["structured_output"] = structured
+                        print(json.dumps({"event": "result", "result": res_obj}), flush=True)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_cli.chmod(fake_cli.stat().st_mode | stat.S_IXUSR)
+
+            stage_base = tmp_p / "advisor_base"
+            stage_base.mkdir()
+            advisor = Advisor(str(fake_cli), str(stage_base))
+            try:
+                # 1. Project directive (single_turn + schema + readonly_files) stages, audits read/denied, & cleans up!
+                await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    project=Initialize(
+                        id="roproj", phase="p1", action="init", objective="Stop safely", frozen_gate="6/8",
+                        score_name="s", baseline_score=2, pass_score=6, route="r0",
+                    ),
+                )
+                d_res = await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    readonly_files=[str(code_file), str(eval_file)],
+                    project=Directive(
+                        id="roproj",
+                        phase="p1",
+                        action="directive",
+                        directive="Train 100k more steps under existing braking gate.",
+                        route="r1-more-steps",
+                    ),
+                )
+                self.assertEqual(d_res["review_status"], "decided")
+                self.assertTrue(d_res["dissent_raised"])
+                self.assertEqual(d_res["readonly_files_staged"], ["braking_gate.py", "eval_summary.json"])
+                self.assertEqual(d_res["readonly_files_read"], ["braking_gate.py"])
+                self.assertEqual(len(d_res["readonly_denied_calls"]), 1)
+                self.assertIn("hooks=True no_read_deny=True write_denied=True files=2", d_res["project"]["last_decision"]["why"])
+                # Single-turn staging workspace MUST be cleaned up immediately!
+                self.assertEqual(list(stage_base.glob("ro-*")), [])
+
+                # 2. Multi-turn Q&A with readonly_files retains staging dir across follow-ups & blocks changing whitelist
+                qa1 = await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    question="Check braking_gate.py for feasibility.",
+                    readonly_files=[str(code_file)],
+                )
+                self.assertIn("hooks=True files=1 has_manifest=True", qa1["advice"])
+                self.assertEqual(len(list(stage_base.glob("ro-*"))), 1)
+                qa2 = await execute_advise(
+                    store=self.store,
+                    advisor=advisor,
+                    question="Follow-up on line 1.",
+                    session_id=qa1["session_id"],
+                )
+                self.assertIn("turn=2 hooks=True files=1", qa2["advice"])
+                with self.assertRaises(ValueError):
+                    await execute_advise(
+                        store=self.store,
+                        advisor=advisor,
+                        question="Try changing files mid-session",
+                        session_id=qa1["session_id"],
+                        readonly_files=[str(eval_file)],
+                    )
+
+                # 3. Telemetry summarizes readonly_grounding accurately
+                summary = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path)
+                rg = summary["readonly_grounding"]
+                self.assertEqual(rg["grounded_calls"], 3)
+                self.assertEqual(rg["files_staged"], 4)
+                self.assertEqual(rg["files_read"], 3)
+                self.assertEqual(rg["denied_tool_attempts"], 1)
+                md = format_summary(summary)
+                self.assertIn("Read-Only Grounding", md)
+            finally:
+                await advisor.stop()
+                advisor.cleanup_workspaces()
+                self.assertEqual(list(stage_base.glob("ro-*")), [])
+
+    def test_child_env_strips_ssh_markers_when_dbus_socket_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bus = Path(tmp) / "bus"
+            fake_bus.write_text("", encoding="utf-8")
+            base = {
+                "PATH": "/usr/bin",
+                "SSH_CONNECTION": "10.0.0.1 12345 10.0.0.2 22",
+                "SSH_CLIENT": "10.0.0.1 12345 22",
+                "SSH_TTY": "/dev/pts/3",
+            }
+            # When bus exists on Linux -> strip SSH_* and populate DBUS_SESSION_BUS_ADDRESS
+            cleaned = _build_child_env(base, platform="linux", uid=1000, bus_path_override=fake_bus)
+            self.assertNotIn("SSH_CONNECTION", cleaned)
+            self.assertNotIn("SSH_CLIENT", cleaned)
+            self.assertNotIn("SSH_TTY", cleaned)
+            self.assertEqual(cleaned["DBUS_SESSION_BUS_ADDRESS"], f"unix:path={fake_bus}")
+
+            # Preserve explicit DBUS_SESSION_BUS_ADDRESS if already set
+            with_dbus = {**base, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/custom/bus"}
+            cleaned2 = _build_child_env(with_dbus, platform="linux", uid=1000, bus_path_override=fake_bus)
+            self.assertEqual(cleaned2["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/custom/bus")
+            self.assertNotIn("SSH_CONNECTION", cleaned2)
+
+            # Opt-out via AGY_ADVISE_KEEP_SSH_ENV=1 preserves SSH vars untouched
+            kept = _build_child_env({**base, "AGY_ADVISE_KEEP_SSH_ENV": "1"}, platform="linux", uid=1000, bus_path_override=fake_bus)
+            self.assertIn("SSH_CONNECTION", kept)
+            self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", kept)
+
+            # When no local D-Bus socket exists (true headless server), leave SSH vars untouched
+            missing = Path(tmp) / "no-such-bus"
+            headless = _build_child_env(base, platform="linux", uid=1000, bus_path_override=missing)
+            self.assertIn("SSH_CONNECTION", headless)
+            self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", headless)
 
 
 if __name__ == "__main__":

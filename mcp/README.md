@@ -1,23 +1,27 @@
 # agy-advise-mcp
 
-`agy-advise-mcp` 是 [`pi-agy_advise`](../README.md) 的**可选 Python MCP 配套**。它与 Pi 的 TypeScript 扩展共享同一个本机原生 `agy` CLI，面向 Codex 和其他 MCP 客户端，定位为**敢提反对意见、跳出局部最优解的远程 AI 总指挥**。
+`agy-advise-mcp` 是 [`pi-agy_advise`](../README.md) 的**可选 Python MCP 配套**。它与 Pi 的 TypeScript 扩展共享同一个本机原生 `agy` CLI，面向 Codex 和其他 MCP 客户端，定位为**第一性原理驱动、敢提反对意见、可白名单只读查证代码与评测 JSON 的远程 AI 总指挥**。
 
 它不是 Pi TypeScript 扩展的替代品，也不会随 Pi 扩展自动加载。只使用轻量问答时，无需安装这里的 Python 依赖。
 
 ## 两种配套实现的分工
 
 - **Pi TypeScript 扩展**：轻量问答、审查立场、会话控制、模型与推理档位覆盖。
-- **`agy-advise-mcp`**：全局问答之外，提供持久化项目决策核心、人类指令反方预验尸（`directive`）、阶段冻结（`suspend`）、分级置顶 L2 因果记忆、原生 `--json-schema` 结构化裁决、闭环结果归因（`track_record`）与可切片调用审计。
+- **`agy-advise-mcp`**：全局问答之外，提供持久化项目决策核心、人类方向变更**强制短红队预验尸**（`directive`）、白名单只读文件一手核验（`readonly_files`）、阶段冻结（`suspend`）、分级置顶 L2 因果记忆、原生 `--json-schema` 结构化裁决、闭环结果归因（`track_record`）与可切片调用审计。
 
 两种实现使用同一个 `agy_advise` 工具名，但不共享会话、SQLite 项目状态或审计日志。
 
 ## 核心能力
 
-- **全局指挥与反顺从异议**：默认 `global` / `red_team` 视角主动挑战前提与局部最优解；即使是人类拍板的 `directive` 也会默认做一次快速反方预验尸（`concur` / `caution` 自动生效免盖章往返，`dissent` 亮红牌呈报异议并允许人类显式覆盖）。
+- **第一性原理指挥与强制方向红队**：默认 `global` / `red_team` 视角先做四类根因判别（`implementation_bug` / `data_coverage` / `optimization_mismatch` / `constraint_or_capacity`）并主动质疑局部最优；**凡人类变更方向、路线、假设大类或解封 `HOLD`，`directive` 在代码层强制运行短红队预验尸**（`concur`/`caution` 自动附护栏与最便宜证伪测试放行，`dissent` 亮红牌暂停呈报并支持人类显式覆盖）。
+- **三层隔离的白名单只读文件取证（`readonly_files`）**：支持显式传入最多 12 个本地代码/配置/评测 JSON（单文件 ≤512KB、总量 ≤2MB）：
+  1. 本地预校验拦截目录、二进制及 `.env`/密钥/凭据/`~/.ssh`/`~/.gemini`/账本数据库；
+  2. 复制为 `0o444` 只读快照到独立临时目录的 `readonly_evidence/`（`0o555`）；
+  3. 同时启用 `--settings` 禁止写/执行/联网与 `.agents/hooks.json` 失败关闭型 `PreToolUse` 钩子，**仅放行对精确快照路径的 `read_file`/`view_file`**，并将顾问实际读取的文件与拦截记录写入审计日志。
 - **动态预算与宪法解耦**：不可妥协红线（`non_negotiables`）与可重批阶段预算（`budget_envelope`）分离，杜绝 L1 状态与最新预算自相矛盾。
-- **反空转与反 HOLD-churn**：拦截 `HOLD` 内影子试次（核验走独立 `unblock_check`）、提供 `suspend` 归档终态、分级 `regression_severity="hard"|"soft"`、修复跨周期护栏误杀 `max_trials=3..5` 跑道，以及封堵定性模式伪装数值门禁。
-- **不失忆的分级 L2 记忆与瘦身 Prompt**：`pin_facts` 置顶核心因果规律永不被 FIFO 挤出，`governance_notes` 独立存放行政纪要；配合原生 `agy --json-schema` 与 `--disable-slash-commands`，显著压缩输入/输出噪声。
-- **闭环结果归因 + MCP 内置反馈**：自动追踪每轮周期的真分兑现率、跑道利用率与 `dissent_vindicated / dissent_refuted`，支持 `action: "feedback"` 直接在 MCP 内打标，以及 `audit_report.py --since / --after-line` 切片审计。
+- **反空转与反 HOLD-churn**：拦截 `HOLD` 内影子试次（核验走独立 `unblock_check`）、提供 `suspend` 归档终态、分级 `regression_severity="hard"|"soft"`、修复跨周期 `global_proxy_drift` / `macro_stagnation` 误杀新 `PIVOT` 多步跑道首试的问题，以及封堵定性模式伪装数值门禁。
+- **不失忆的分级 L2 记忆与原生 Schema**：`pin_facts` 置顶核心因果规律永不被 FIFO 挤出，`governance_notes` 独立存放行政纪要，配合原生 `agy --json-schema`、`--disable-slash-commands` 与更紧凑的 `directive` 记忆包。
+- **闭环结果归因 + MCP 内置反馈**：自动追踪每轮周期真分兑现率、跑道利用率与 `dissent_vindicated / dissent_refuted`，支持 `action: "feedback"` 直接在 MCP 内打标，以及 `audit_report.py --since / --after-line` 切片审计。
 
 ## 前置条件
 
@@ -48,6 +52,8 @@ args = ["/absolute/path/to/pi-agy_advise/mcp/scripts/server.py", "/home/USER/.lo
 tool_timeout_sec = 270
 ```
 
+其他 MCP 客户端可使用相同的 stdio 命令和参数。修改配置后重启对应客户端或 MCP 会话。
+
 如需安装调用规范 Skill，可将本目录链接到 Codex 的 Skill 目录；不要覆盖已有安装：
 
 ```bash
@@ -69,12 +75,12 @@ ln -s /absolute/path/to/pi-agy_advise/mcp ~/.codex/skills/agy-advise
 默认状态目录为 `~/.local/share/codex-agy-advise/`：
 
 - `projects.sqlite3`：项目目标、预算包络、试次、核验记录、分级记忆、裁决与闭环归因。
-- `invocations.jsonl`：以 `0600` 权限写入的调用元数据（含 `model_configured`、`prompt_chars`、`directive_alignment`）与截断预览。
+- `invocations.jsonl`：以 `0600` 权限写入的调用元数据（含 `model_configured`、`prompt_chars`、`directive_alignment`、`is_direction_change`、`readonly_files_staged`、`readonly_files_read`、`readonly_denied_calls`）与截断预览。
 - `feedback.jsonl`：人工或 MCP 内置记录的质量反馈。
 
-环境变量：`AGY_ADVISE_DB`、`AGY_ADVISE_LOG`、`AGY_ADVISE_LOG_FULL=1`、`AGY_ADVISE_MODEL`。
+环境变量：`AGY_ADVISE_DB`、`AGY_ADVISE_LOG`、`AGY_ADVISE_LOG_FULL=1`、`AGY_ADVISE_MODEL`、`AGY_ADVISE_KEEP_SSH_ENV=1`（默认在 Linux 检测到 `/run/user/<uid>/bus` 时自动清理 `SSH_CONNECTION`/`SSH_CLIENT`/`SSH_TTY` 并补齐 `DBUS_SESSION_BUS_ADDRESS`，避免 SSH 会话误退回文件凭证导致重复登录；设为 `1` 可保留原始 SSH 环境）。
 
-仅显式提交的 `question`、`context` 和项目复盘包会发送给 Google。顾问 CLI 保持现有安全权限：在临时目录中运行，文件、命令、浏览器和 MCP 工具均被禁用。不要发送密钥、凭据或未授权敏感内容。
+未传 `readonly_files` 时，顾问 CLI 在空临时目录中运行且所有工具（读/写/命令/浏览器/MCP/联网）均被禁用；传入 `readonly_files` 时，仅允许对白名单文件的隔离只读快照执行 `read_file`，写文件、命令、联网及白名单外读取均被双重拦截。不要传入密钥、凭据或未授权敏感内容。
 
 ## 审计与反馈
 

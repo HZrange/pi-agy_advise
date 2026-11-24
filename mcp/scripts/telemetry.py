@@ -179,6 +179,14 @@ def build_invocation_record(
         else (proj.get("review_reasons") if isinstance(proj.get("review_reasons"), list) else [])
     )
 
+    ro_staged = resp.get("readonly_files_staged") if isinstance(resp.get("readonly_files_staged"), list) else []
+    ro_read = resp.get("readonly_files_read") if isinstance(resp.get("readonly_files_read"), list) else []
+    ro_denied = resp.get("readonly_denied_calls") if isinstance(resp.get("readonly_denied_calls"), list) else []
+    ro_bytes = resp.get("readonly_files_bytes") if isinstance(resp.get("readonly_files_bytes"), int) else 0
+    is_dir_change = resp.get("is_direction_change")
+    if is_dir_change is None and isinstance(last_decision.get("is_direction_change"), bool):
+        is_dir_change = last_decision["is_direction_change"]
+
     record: dict[str, Any] = {
         "ts": utc_now(),
         "invocation_id": invocation_id,
@@ -209,10 +217,16 @@ def build_invocation_record(
         "review_reasons": effective_reasons,
         "decision": decision_value,
         "directive_alignment": directive_alignment,
+        "is_direction_change": bool(is_dir_change) if action == "directive" else None,
         "dissent_raised": dissent_raised,
         "decision_max_trials": decision_max_trials,
         "hypothesis_family": hypothesis_family,
         "dispatch_allowed": proj.get("dispatch_allowed"),
+        "readonly_files_count": len(ro_staged),
+        "readonly_files_bytes": ro_bytes,
+        "readonly_files_staged": ro_staged,
+        "readonly_files_read": ro_read,
+        "readonly_denied_calls": len(ro_denied),
         "question_chars": len(question or ""),
         "context_chars": len(context or ""),
         "prompt_chars": effective_prompt_chars if isinstance(effective_prompt_chars, int) else None,
@@ -487,6 +501,18 @@ def summarize_logs(
     directive_dissent_rate = (
         round(directive_alignments["dissent"] / directive_total, 3) if directive_total else None
     )
+    direction_change_checks = sum(
+        1
+        for row in filtered
+        if row.get("mode") == "project"
+        and row.get("action") == "directive"
+        and row.get("is_direction_change") is True
+    )
+
+    ro_grounded_rows = [row for row in llm_rows if (row.get("readonly_files_count") or 0) > 0]
+    ro_total_staged = sum(int(row.get("readonly_files_count") or 0) for row in ro_grounded_rows)
+    ro_total_read = sum(len(row.get("readonly_files_read") or []) for row in ro_grounded_rows)
+    ro_total_denied = sum(int(row.get("readonly_denied_calls") or 0) for row in filtered)
 
     effective_db = db_path
     if effective_db is None and log_path is not None:
@@ -541,6 +567,15 @@ def summarize_logs(
     if directive_total >= 5 and directive_alignments["caution"] == 0 and directive_alignments["dissent"] == 0:
         hints.append(
             f"Potential rubber-stamp risk: {directive_total}/{directive_total} directive checks returned 'concur' with zero caution/dissent."
+        )
+    if len(ro_grounded_rows) >= 3 and ro_total_read == 0:
+        hints.append(
+            f"Read-only files were staged in {len(ro_grounded_rows)} calls ({ro_total_staged} files) but advisor read 0 files: "
+            "verify prompt grounding or check if attached files were relevant."
+        )
+    if ro_total_denied > 0:
+        hints.append(
+            f"Read-only whitelist guard blocked {ro_total_denied} out-of-whitelist/disallowed tool attempt(s); inspect logs to confirm expected behavior."
         )
     for item in project_efficiency:
         alerts = item.get("macro_alerts") or []
@@ -619,8 +654,15 @@ def summarize_logs(
         },
         "directives": {
             "total_checked": directive_total,
+            "direction_changes": direction_change_checks,
             "alignment_counts": dict(directive_alignments),
             "dissent_rate": directive_dissent_rate,
+        },
+        "readonly_grounding": {
+            "grounded_calls": len(ro_grounded_rows),
+            "files_staged": ro_total_staged,
+            "files_read": ro_total_read,
+            "denied_tool_attempts": ro_total_denied,
         },
         "governance_efficiency": {
             "review_to_report_ratio": review_to_report_ratio,
@@ -678,8 +720,15 @@ def format_summary(summary: dict[str, Any]) -> str:
     if summary.get("directives", {}).get("total_checked"):
         d = summary["directives"]
         lines.append(
-            f"- **Directive Pre-Mortems**: total={d['total_checked']}, alignments={d['alignment_counts']}, "
-            f"dissent_rate={d['dissent_rate']:.0%}"
+            f"- **Directive Pre-Mortems**: total={d['total_checked']} (direction_changes={d.get('direction_changes', 0)}), "
+            f"alignments={d['alignment_counts']}, dissent_rate={d['dissent_rate']:.0%}"
+        )
+    if summary.get("readonly_grounding", {}).get("grounded_calls"):
+        rg = summary["readonly_grounding"]
+        lines.append(
+            f"- **Read-Only Grounding**: grounded_calls={rg['grounded_calls']}, "
+            f"files_staged={rg['files_staged']}, files_read={rg['files_read']}, "
+            f"denied_attempts={rg['denied_tool_attempts']}"
         )
     if summary["projects"]:
         lines.append(f"- **Projects**: {summary['projects']}")
