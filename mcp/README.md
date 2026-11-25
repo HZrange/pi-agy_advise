@@ -13,10 +13,10 @@
 
 ## 核心能力
 
-- **第一性原理指挥与强制方向红队**：默认 `global` / `red_team` 视角先做四类根因判别（`implementation_bug` / `data_coverage` / `optimization_mismatch` / `constraint_or_capacity`）并主动质疑局部最优；**凡人类变更方向、路线、假设大类或解封 `HOLD`，`directive` 在代码层强制运行短红队预验尸**（`concur`/`caution` 自动附护栏与最便宜证伪测试放行，`dissent` 亮红牌暂停呈报并支持人类显式覆盖）。
+- **第一性原理指挥与强制方向红队**：默认 `global` / `red_team` 视角先做四类根因判别（`implementation_bug` / `data_coverage` / `optimization_mismatch` / `constraint_or_capacity`）并主动质疑局部最优，自由问答内置紧凑延迟预算（≤1,200 字四段式输出约束）；**凡人类变更方向、路线、假设大类或解封 `HOLD`，`directive` 在代码层强制运行短红队预验尸**（`concur`/`caution` 自动附护栏与最便宜证伪测试放行，`dissent` 亮红牌暂停呈报并支持人类显式覆盖）。
 - **智能内联 + 三层隔离的白名单只读文件取证（`readonly_files`）**：支持显式传入最多 12 个本地代码/配置/评测 JSON（单文件 ≤512KB、总量 ≤2MB）：
   1. 本地预校验拦截目录、二进制及 `.env`/密钥/凭据/`~/.ssh`/`~/.gemini`/账本数据库；
-  2. **小文件自动带行号内联**（单文件 ≤24KB 且总计 ≤36KB，零工具单回合完成，消除多轮 `read_file` 往返延迟；可通过 `AGY_ADVISE_INLINE_READONLY=off` 强制走快照模式）；
+  2. **小文件自动带行号内联**（单文件 ≤24KB 且总计 ≤48KB，零工具单回合完成，消除多轮 `read_file` 往返延迟；可通过 `AGY_ADVISE_INLINE_READONLY=off` 强制走快照模式）；
   3. **大文件三层快照钩子隔离**：复制为 `0o444` 只读快照到独立临时目录 `readonly_evidence/`（`0o555`），启用 `--settings` 禁止写/执行/联网与 `.agents/hooks.json` 失败关闭型 `PreToolUse` 钩子，**仅放行对精确快照路径的 `read_file`/`view_file`**，并将取证模式、实读文件与拦截记录写入审计日志。
 - **动态预算与宪法解耦**：不可妥协红线（`non_negotiables`）与可重批阶段预算（`budget_envelope`）分离，杜绝 L1 状态与最新预算自相矛盾。
 - **反空转、反 HOLD-churn 与反软异议逃逸**：拦截 `HOLD` 内影子试次（核验走独立 `unblock_check`）、提供 `suspend` 归档终态、分级 `regression_severity="hard"|"soft"`、新增 `directive_churn` 告警与反 `caution-creep` 自动升级机制（空转期 `caution` 夹带 `dissent_points` 自动升级为 `DISSENT` 暂停确认）、修复跨周期护栏误杀新跑道首试，以及封堵定性模式伪装数值门禁。

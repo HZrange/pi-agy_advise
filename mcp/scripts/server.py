@@ -32,7 +32,7 @@ MAX_READONLY_FILES = 12
 MAX_READONLY_FILE_BYTES = 512 * 1024
 MAX_READONLY_TOTAL_BYTES = 2 * 1024 * 1024
 INLINE_READONLY_MAX_FILE_BYTES = 24 * 1024
-INLINE_READONLY_MAX_TOTAL_BYTES = 36 * 1024
+INLINE_READONLY_MAX_TOTAL_BYTES = 48 * 1024
 
 _SENSITIVE_DIR_NAMES = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker"})
 _SENSITIVE_EXACT_NAMES = frozenset(
@@ -532,6 +532,16 @@ def build_advice_prompt(
             "independent parallel tracks), and a concrete falsification or stop condition. Leave local "
             "implementation arithmetic/flags to the executor. Match the language of the question."
         )
+
+    sections.append(
+        "Output & Latency Budget (STRICT — optimize for fast, decisive turnaround well inside timeout):\n"
+        "- Target <= 1,200 Chinese characters (~500-800 English words) total; never write essay-length reports.\n"
+        "- Organize into at most 4 short sections: (1) Dissent / Premise Check, (2) Root-Cause Class & Grounded Evidence "
+        "(cite exact `filename:line` or JSON keys; separate confirmed facts vs unknowns), (3) At most 2 Highest-Leverage Actions "
+        "+ Cheapest Falsifying Check, (4) Clear Stop / Pivot Condition.\n"
+        "- Do NOT transcribe raw tables/code blocks from attached files, repeat prompt context, or spend long reasoning chains "
+        "on exhaustive side-derivations. Commit once the decisive bottleneck is verified; match the language of the question."
+    )
     return "\n\n".join(sections)
 
 
@@ -1139,16 +1149,22 @@ def server(executable: str) -> FastMCP:
         model: Annotated[str | None, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")] = None,
         stance: Annotated[
             Stance | None,
-            Field(description="Advisor stance for Q&A: global (default), red_team, or tactical."),
+            Field(
+                description=(
+                    "Advisor stance for Q&A: global (default), red_team, or tactical "
+                    "(avoid bypassing a stalled active project ledger with repeated tactical Q&A)."
+                )
+            ),
         ] = None,
         readonly_files: Annotated[
             list[str] | None,
             Field(
                 max_length=MAX_READONLY_FILES,
                 description=(
-                    "Optional explicit whitelist of local code/JSON files to stage as 0o444 read-only snapshots "
-                    "for primary-artifact verification (max 12 files, <=512KB each, <=2MB total; writes, commands, "
-                    "network, secrets, and out-of-whitelist reads remain strictly blocked)."
+                    "Optional explicit whitelist of local code/JSON files for primary-artifact verification "
+                    "(max 12 files, <=512KB each, <=2MB total; small UTF-8 bundles <=24KB/file & <=48KB total "
+                    "inline directly in zero-tool mode, larger files stage as 0o444 snapshots under a fail-closed "
+                    "PreToolUse hook; writes, commands, network, secrets, and out-of-whitelist reads stay blocked)."
                 ),
             ),
         ] = None,

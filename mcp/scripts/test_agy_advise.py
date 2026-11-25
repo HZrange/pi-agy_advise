@@ -55,6 +55,7 @@ from project import (  # noqa: E402
 )
 from server import (  # noqa: E402
     Advisor,
+    INLINE_READONLY_MAX_TOTAL_BYTES,
     MAX_READONLY_FILES,
     MAX_READONLY_FILE_BYTES,
     READONLY_SESSION_SETTINGS,
@@ -63,6 +64,7 @@ from server import (  # noqa: E402
     execute_advise,
     prepare_readonly_workspace,
     server,
+    try_build_inline_readonly_bundle,
     validate_readonly_files,
 )
 from telemetry import format_summary, read_jsonl, record_feedback, summarize_logs  # noqa: E402
@@ -660,16 +662,21 @@ class ProjectCoreTests(IsolatedAsyncioTestCase):
         p_global = build_advice_prompt("Should I tweak cache TTL?", "Latency spiked", "global", is_followup=False)
         self.assertIn("Zoom out before zooming in", p_global)
         self.assertIn("challenge the premise", p_global)
+        self.assertIn("Output & Latency Budget", p_global)
+        self.assertIn("<= 1,200 Chinese characters", p_global)
 
         p_red = build_advice_prompt("Review sharding plan", None, "red_team", is_followup=False)
         self.assertIn("Red-Team Audit", p_red)
+        self.assertIn("Output & Latency Budget", p_red)
 
         p_tac = build_advice_prompt("Pick hash function", None, "tactical", is_followup=False)
         self.assertIn("Focused Tactical", p_tac)
+        self.assertIn("Do NOT transcribe raw tables", p_tac)
 
         p_follow = build_advice_prompt("New trace attached", "CPU 95%", "global", is_followup=True)
         self.assertIn("Continue this independent review", p_follow)
         self.assertNotIn("Zoom out before zooming in", p_follow)
+        self.assertIn("Output & Latency Budget", p_follow)
 
 
 class FakeCliStreamingTests(IsolatedAsyncioTestCase):
@@ -2508,6 +2515,39 @@ class TelemetryAndAuditTests(IsolatedAsyncioTestCase):
             headless = _build_child_env(base, platform="linux", uid=1000, bus_path_override=missing)
             self.assertIn("SSH_CONNECTION", headless)
             self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", headless)
+
+    async def test_inline_readonly_48kb_bundle_and_verbose_qa_telemetry_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Three 14KB UTF-8 files = 42KB total (<= 48KB inline cap) -> MUST inline cleanly
+            files_42k = []
+            for idx in range(3):
+                p = root / f"part_{idx}.json"
+                p.write_text('{"x": "' + ("a" * 14000) + '"}\n', encoding="utf-8")
+                files_42k.append(p.resolve())
+            bundle = try_build_inline_readonly_bundle(files_42k)
+            self.assertIsNotNone(bundle)
+            block, names, total_bytes = bundle
+            self.assertEqual(names, ["part_0.json", "part_1.json", "part_2.json"])
+            self.assertGreater(total_bytes, 36 * 1024)
+            self.assertLessEqual(total_bytes, INLINE_READONLY_MAX_TOTAL_BYTES)
+            self.assertIn("1: {\"x\":", block)
+
+            # Adding a fourth 14KB file = 56KB (> 48KB) -> falls back to staged_hook (None)
+            p4 = root / "part_3.json"
+            p4.write_text('{"x": "' + ("b" * 14000) + '"}\n', encoding="utf-8")
+            self.assertIsNone(try_build_inline_readonly_bundle(files_42k + [p4.resolve()]))
+
+        # Two bloated Q&A replies (>4000 chars) trigger Verbose/slow Q&A tuning hint and populate qa avg metrics
+        advisor = FakeAdvisor(["A" * 5200, "B" * 4800])
+        await execute_advise(store=self.store, advisor=advisor, question="Deep physics question 1 for verbosity check.")
+        await execute_advise(store=self.store, advisor=advisor, question="Deep physics question 2 for verbosity check.")
+        summary = summarize_logs(self.log_path, self.fb_path, db_path=self.db_path)
+        self.assertEqual(summary["qa"]["avg_advice_chars"], 5000)
+        self.assertIsNotNone(summary["qa"]["avg_elapsed_seconds"])
+        self.assertTrue(any("Verbose/slow Q&A turns" in hint for hint in summary["tuning_hints"]))
+        md = format_summary(summary)
+        self.assertIn("5000ch", md)
 
 
 if __name__ == "__main__":

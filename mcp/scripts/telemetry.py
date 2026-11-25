@@ -501,6 +501,21 @@ def summarize_logs(
     cache_hit_rate = round(cache_hits / len(llm_responded_rows), 3) if llm_responded_rows else None
 
     qa_rows = [row for row in filtered if row.get("mode") == "qa"]
+    qa_responded_rows = [row for row in qa_rows if _row_responded(row)]
+    qa_elapsed_vals = [
+        float(row["elapsed_seconds"])
+        for row in qa_responded_rows
+        if isinstance(row.get("elapsed_seconds"), (int, float))
+    ]
+    qa_advice_chars_vals = [
+        int(row["advice_chars"])
+        for row in qa_responded_rows
+        if isinstance(row.get("advice_chars"), int) and row["advice_chars"] > 0
+    ]
+    qa_avg_elapsed = round(sum(qa_elapsed_vals) / len(qa_elapsed_vals), 2) if qa_elapsed_vals else None
+    qa_avg_advice_chars = (
+        round(sum(qa_advice_chars_vals) / len(qa_advice_chars_vals)) if qa_advice_chars_vals else None
+    )
     substantive_qa_rows = [row for row in qa_rows if (row.get("question_chars") or 0) > 20]
     tactical_qa_count = sum(1 for row in substantive_qa_rows if row.get("stance") == "tactical")
     tactical_qa_ratio = (
@@ -619,6 +634,11 @@ def summarize_logs(
             f"Heavy review latency/prompt overhead (avg_elapsed={avg_elapsed}s, avg_prompt_chars={avg_prompt_chars}): "
             "keep L2 pinned facts crisp and avoid dumping long procedural SOPs into questions."
         )
+    if len(qa_responded_rows) >= 2 and ((qa_avg_elapsed or 0.0) > 120.0 or (qa_avg_advice_chars or 0) > 4000):
+        hints.append(
+            f"Verbose/slow Q&A turns (avg_elapsed={qa_avg_elapsed}s, avg_advice={qa_avg_advice_chars}ch): "
+            "keep questions tightly scoped, attach <=48KB inline readonly_files when possible, and use effort='low'/'medium'."
+        )
     if directive_total >= 5 and directive_alignments["caution"] == 0 and directive_alignments["dissent"] == 0:
         hints.append(
             f"Potential rubber-stamp risk: {directive_total}/{directive_total} directive checks returned 'concur' with zero caution/dissent."
@@ -711,6 +731,8 @@ def summarize_logs(
             "followups": followup_count,
             "stance_counts": dict(stance_counts),
             "substantive_tactical_ratio": tactical_qa_ratio,
+            "avg_elapsed_seconds": qa_avg_elapsed,
+            "avg_advice_chars": qa_avg_advice_chars,
         },
         "directives": {
             "total_checked": directive_total,
@@ -779,9 +801,14 @@ def format_summary(summary: dict[str, Any]) -> str:
             if summary["qa"].get("substantive_tactical_ratio") is not None
             else ""
         )
+        qa_lat_part = (
+            f", avg={summary['qa']['avg_elapsed_seconds']}s/{summary['qa']['avg_advice_chars']}ch"
+            if summary["qa"].get("avg_elapsed_seconds") is not None
+            else ""
+        )
         lines.append(
             f"- **Q&A**: total={summary['qa']['total']}, followups={summary['qa']['followups']}, "
-            f"stances={summary['qa']['stance_counts']}{tac_part}"
+            f"stances={summary['qa']['stance_counts']}{tac_part}{qa_lat_part}"
         )
     if summary.get("directives", {}).get("total_checked"):
         d = summary["directives"]
